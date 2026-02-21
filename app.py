@@ -6,6 +6,18 @@ from collections import defaultdict, deque
 app = Flask(__name__)
 
 # -----------------------
+# CORS (IMPORTANTE para fetch desde navegador / Claude Artifacts)
+# -----------------------
+@app.after_request
+def add_cors_headers(resp):
+    # Para pruebas: permite cualquier origen (incluye file:// => Origin: null y claude.ai)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-BRIDGE-TOKEN"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
+# -----------------------
 # Config general
 # -----------------------
 DEFAULT_PROVIDER = os.environ.get("DEFAULT_PROVIDER", "groq")
@@ -91,7 +103,7 @@ def _read_text_from_request():
         context = data.get("context", "") or ""
         return text, context
 
-    # multipart
+    # multipart / form
     text = request.form.get("text", "") or ""
     context = request.form.get("context", "") or ""
     file = request.files.get("file")
@@ -101,7 +113,7 @@ def _read_text_from_request():
     return text, context
 
 def _build_prompt(text: str, context: str) -> str:
-    text = text.strip()
+    text = (text or "").strip()
     context = (context or "").strip()
     if len(context) > MAX_CONTEXT_CHARS:
         context = context[:MAX_CONTEXT_CHARS]
@@ -142,10 +154,10 @@ def call_groq(prompt: str, model: str, temperature: float, max_tokens: int, stre
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         return None, "(sin GROQ_API_KEY)", 500
-   
-   # De momento permitimos todos los modelos
-   # if ALLOWED_MODELS_GROQ and model not in ALLOWED_MODELS_GROQ:
-   #     return None, f"(modelo Groq no permitido: {model})", 400
+
+    # De momento permitimos todos los modelos
+    # if ALLOWED_MODELS_GROQ and model not in ALLOWED_MODELS_GROQ:
+    #     return None, f"(modelo Groq no permitido: {model})", 400
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {
@@ -175,8 +187,8 @@ def call_openai(prompt: str, model: str, temperature: float, max_tokens: int, st
         return None, "(sin OPENAI_API_KEY)", 500
 
     # De momento permitimos todos los modelos
-    #if ALLOWED_MODELS_OPENAI and model not in ALLOWED_MODELS_OPENAI:
-    #    return None, f"(modelo OpenAI no permitido: {model})", 400
+    # if ALLOWED_MODELS_OPENAI and model not in ALLOWED_MODELS_OPENAI:
+    #     return None, f"(modelo OpenAI no permitido: {model})", 400
 
     url = "https://api.openai.com/v1/chat/completions"
     payload = {
@@ -245,8 +257,12 @@ def sse_from_openai_compatible(resp: requests.Response):
 def home():
     return "SUPER BRIDGE ONLINE 🔥"
 
-@app.route("/api/message", methods=["GET", "POST"])
+@app.route("/api/message", methods=["GET", "POST", "OPTIONS"])
 def api_message():
+    # Preflight CORS (IMPORTANTE para fetch POST/JSON y algunos entornos)
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     # Seguridad y rate limit
     tok = _require_token()
     if tok is not None:
@@ -263,7 +279,13 @@ def api_message():
 
     prompt = _build_prompt(text, context)
 
-    resp, err, status = dispatch(provider, prompt, model, temperature, max_tokens, stream)
+    try:
+        resp, err, status = dispatch(provider, prompt, model, temperature, max_tokens, stream)
+    except requests.RequestException as e:
+        return jsonify({"content": f"(upstream error) {str(e)}"}), 502
+    except Exception as e:
+        return jsonify({"content": f"(internal error dispatch) {str(e)}"}), 500
+
     if err:
         return jsonify({"content": err}), status or 500
 
@@ -271,8 +293,13 @@ def api_message():
     if not stream:
         if resp.status_code >= 400:
             return jsonify({"content": f"({provider} HTTP {resp.status_code}) {resp.text}"}), 500
-        data = resp.json()
-        out = data["choices"][0]["message"]["content"].strip()
+
+        try:
+            data = resp.json()
+            out = data["choices"][0]["message"]["content"].strip()
+        except Exception:
+            return jsonify({"content": f"({provider}) respuesta no válida: {resp.text}"}), 500
+
         return jsonify({"content": out, "provider": provider, "model": model})
 
     # Stream: devolver texto plano (chunked)
@@ -284,3 +311,7 @@ def api_message():
         mimetype="text/plain; charset=utf-8",
         headers={"Cache-Control": "no-cache"},
     )
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
