@@ -1,15 +1,28 @@
-from flask import Flask, request, jsonify
+import requests
+import os
 
-app = Flask(__name__)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
 
 @app.get("/api/message")
 def message():
     text = request.args.get("text", "")
-    return jsonify({"content": f"En el servidor he procesado este texto: {text}"})
 
-@app.get("/")
-def home():
-    return "OK"
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "llama3-70b-8192",
+            "messages": [
+                {"role": "user", "content": text}
+            ]
+        }
+    )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    data = response.json()
+    result = data["choices"][0]["message"]["content"]
+
+    return jsonify({"content": result})
