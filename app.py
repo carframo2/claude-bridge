@@ -27,8 +27,8 @@ def call_groq(prompt, model=None):
     chosen_model = model or DEFAULT_MODEL
 
     # Seguridad opcional
-    if chosen_model not in ALLOWED_MODELS:
-        return f"(modelo no permitido: {chosen_model})"
+    #if chosen_model not in ALLOWED_MODELS:
+    #    return f"(modelo no permitido: {chosen_model})"
 
     payload = {
         "model": chosen_model,
