@@ -6,56 +6,67 @@ import requests
 app = Flask(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "300"))
-DEFAULT_TEMPERATURE = float(os.environ.get("GROQ_TEMPERATURE", "0.3"))
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "600"))
+TEMPERATURE = float(os.environ.get("GROQ_TEMPERATURE", "0.3"))
 
-@app.get("/")
-def home():
-    return "OK"
-
-@app.get("/api/message")
-def message():
-    text = request.args.get("text", "")
-    if not text:
-        return jsonify({"content": "Falta parámetro ?text=..."}), 400
-
+def call_groq(prompt):
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return jsonify({"content": "(sin GROQ_API_KEY)"}), 500
+        return "(sin GROQ_API_KEY)"
 
     payload = {
-        "model": DEFAULT_MODEL,
-        "messages": [{"role": "user", "content": text}],
-        "max_tokens": DEFAULT_MAX_TOKENS,
-        "temperature": DEFAULT_TEMPERATURE,
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE,
     }
 
-    try:
-        resp = requests.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "claude-bridge/1.0",
-            },
-            data=json.dumps(payload),
-            timeout=30,
-        )
+    resp = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(payload),
+        timeout=60,
+    )
 
-        # Si hay 400, devuelve el body de Groq para ver el motivo exacto
-        if resp.status_code >= 400:
-            return jsonify({
-                "content": f"(Groq HTTP {resp.status_code}) {resp.text}"
-            }), 500
+    if resp.status_code >= 400:
+        return f"(Groq HTTP {resp.status_code}) {resp.text}"
 
-        data = resp.json()
-        out = data["choices"][0]["message"]["content"].strip()
-        return jsonify({"content": out})
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
 
-    except Exception as e:
-        return jsonify({"content": f"(error llamando a Groq) {type(e).__name__}: {e}"}), 500
 
-if __name__ == "__main__":
-    # Render usa $PORT; gunicorn no usa este bloque, pero no molesta.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+@app.route("/api/message", methods=["GET", "POST"])
+def message():
+
+    # GET clásico
+    if request.method == "GET":
+        text = request.args.get("text", "")
+        return jsonify({"content": call_groq(text)})
+
+    # POST JSON
+    if request.is_json:
+        data = request.get_json()
+        text = data.get("text", "")
+        context = data.get("context", "")
+        prompt = f"{text}\n\nCONTEXTO:\n{context}"
+        return jsonify({"content": call_groq(prompt)})
+
+    # POST multipart (archivo)
+    text = request.form.get("text", "")
+    file = request.files.get("file")
+
+    if file:
+        content = file.read().decode("utf-8", errors="replace")[:15000]
+        prompt = f"{text}\n\nCONTEXTO:\n{content}"
+        return jsonify({"content": call_groq(prompt)})
+
+    return jsonify({"content": "Formato no soportado"}), 400
+
+
+@app.route("/")
+def home():
+    return "SUPER BRIDGE ONLINE 🔥"
