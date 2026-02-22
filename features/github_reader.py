@@ -6,43 +6,44 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from core.auth import require_token
+from services.github_access import (
+    list_all_projects,
+    list_projects_for_user,
+    parse_projects_full,
+    resolve_project_token,
+    user_allowed_for_project,
+    verify_user_password,
+)
 from services.github_reader import (
     get_file_bytes,
     get_file_meta,
     list_paths_recursive,
-    parse_project_map,
 )
 
 bp = Blueprint("github_reader", __name__, url_prefix="/github")
 
 # ---- Límites (ajústalos a tu gusto) -----------------------------------------
 
-MAX_PATHS_LIMIT = 20000           # máximo paths devueltos por /paths
+MAX_PATHS_LIMIT = 20000
 DEFAULT_PATHS_LIMIT = 5000
 
-MAX_TEXT_BYTES = 2 * 1024 * 1024  # /github/file (JSON) -> 2MB
-MAX_FILE_BYTES_FOR_LINES = 8 * 1024 * 1024  # /github/file_lines / file_chunk / find_in_file
-MAX_LINES_SPAN = 1200             # líneas máximas por petición en /file_lines
-MAX_CHUNK_LINES = 1200            # chunk_lines máximas
+MAX_TEXT_BYTES = 2 * 1024 * 1024
+MAX_FILE_BYTES_FOR_LINES = 8 * 1024 * 1024
+MAX_LINES_SPAN = 1200
+MAX_CHUNK_LINES = 1200
 DEFAULT_CHUNK_LINES = 200
 
-MAX_READMANY_FILES = 20           # /readmany: nº máx ficheros
-MAX_READMANY_TOTAL_BYTES = 3 * 1024 * 1024  # suma de bytes devueltos (texto/binario base64 no cuenta aquí; se limita raw)
-MAX_FIND_HITS = 50                # /find_in_file
+MAX_READMANY_FILES = 20
+MAX_READMANY_TOTAL_BYTES = 3 * 1024 * 1024
+MAX_FIND_HITS = 50
 
+# ---- Helpers generales -------------------------------------------------------
 
-# ---- Helpers ----------------------------------------------------------------
 
 def _json_error(msg: str, status: int = 400, **extra):
     payload = {"ok": False, "error": msg}
     payload.update(extra)
     return jsonify(payload), status
-
-
-def _get_bridge_token() -> str:
-    s = current_app.config["SETTINGS"]
-    return (getattr(s, "GITHUB_TOKEN", "") or "").strip()
 
 
 def _bool_arg(name: str, default: bool = False) -> bool:
@@ -69,15 +70,20 @@ def _safe_path(p: str) -> str:
     p = (p or "").strip().lstrip("/")
     if not p:
         raise ValueError("path vacío")
-    # higiene básica anti-traversal
     parts = p.split("/")
     if any(part in ("", ".", "..") for part in parts):
         raise ValueError("path inválido")
     return p
 
 
+def _safe_project_alias(project: str) -> str:
+    project = (project or "").strip()
+    if not project:
+        raise ValueError("Falta project")
+    return project
+
+
 def _decode_text(data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    # Primero UTF-8 normal, luego UTF-8 BOM
     try:
         return data.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
@@ -89,21 +95,157 @@ def _decode_text(data: bytes) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _split_lines(text: str) -> List[str]:
-    # splitlines() mantiene compatibilidad con CRLF/LF y no incluye saltos
     return text.splitlines()
 
 
+def _parse_paths_multi() -> List[str]:
+    out: List[str] = []
+
+    for p in request.args.getlist("path"):
+        if p and p.strip():
+            out.append(p.strip())
+
+    paths_csv = (request.args.get("paths") or "").strip()
+    if paths_csv:
+        out.extend([p.strip() for p in paths_csv.split(",") if p.strip()])
+
+    seen = set()
+    uniq: List[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+# ---- Auth / ACL --------------------------------------------------------------
+
+def _provided_bridge_token() -> str:
+    return (
+        request.headers.get("X-BRIDGE-TOKEN")
+        or request.args.get("token")
+        or ""
+    ).strip()
+
+
+def _expected_bridge_token() -> str:
+    s = current_app.config["SETTINGS"]
+    return (getattr(s, "BRIDGE_TOKEN", "") or "").strip()
+
+
+def _is_master_bridge_auth() -> bool:
+    expected = _expected_bridge_token()
+    if not expected:
+        return False
+    provided = _provided_bridge_token()
+    return bool(provided and provided == expected)
+
+
+def _provided_user() -> str:
+    return (
+        request.headers.get("X-USER")
+        or request.args.get("user")
+        or ""
+    ).strip()
+
+
+def _provided_pass() -> str:
+    # Soporta headers o query (?pass=...) por compatibilidad con GET “simple”.
+    # OJO: query string es menos seguro (logs/historial).
+    return (
+        request.headers.get("X-PASS")
+        or request.args.get("pass")
+        or request.args.get("password")
+        or ""
+    )
+
+
+def _auth_identity():
+    """
+    Devuelve identidad autenticada:
+      {"mode":"bridge"}  -> admin/master token
+      {"mode":"user", "user":"carlos"}
+    """
+    # 1) Master token (admin)
+    if _is_master_bridge_auth():
+        return {"mode": "bridge", "user": None}
+
+    # 2) User/pass
+    username = _provided_user()
+    password = _provided_pass()
+
+    if not username or not password:
+        return None
+
+    ok, reason = verify_user_password(username, password)
+    if not ok:
+        return {"mode": "invalid", "reason": reason}
+
+    return {"mode": "user", "user": username}
+
+
+def _resolve_project_access(project_alias: str):
+    """
+    Valida autenticación + ACL para un proyecto y devuelve:
+      (identity, project_cfg, github_token)
+    """
+    identity = _auth_identity()
+    if identity is None:
+        return None, _json_error(
+            "Unauthorized: usa X-BRIDGE-TOKEN (admin) o user/pass (+project). "
+            "Recomendado: X-USER y X-PASS en headers; query ?user=&pass= solo como fallback.",
+            401,
+        )
+    if identity.get("mode") == "invalid":
+        return None, _json_error(f"Unauthorized: {identity.get('reason')}", 401)
+
+    # Cargar proyectos configurados
+    try:
+        projects_full = parse_projects_full()
+    except Exception as e:
+        return None, _json_error(f"GITHUB_PROJECTS inválido: {e}", 500)
+
+    if project_alias not in projects_full:
+        return None, _json_error(f"Proyecto no configurado: {project_alias}", 404)
+
+    # ACL solo para modo user
+    if identity["mode"] == "user":
+        username = identity["user"]
+        if not user_allowed_for_project(username, project_alias):
+            return None, _json_error("NO_PERMITIDO", 403, user=username, project=project_alias)
+
+    # Resolver token del proyecto
+    try:
+        gh_token = resolve_project_token(project_alias)
+    except Exception as e:
+        return None, _json_error(f"Token de proyecto no disponible: {e}", 500)
+
+    return {
+        "identity": identity,
+        "project_cfg": projects_full[project_alias],
+        "github_token": gh_token,
+    }, None
+
+
+def _auth_for_projects_listing():
+    """
+    Auth para /github/projects (lista de proyectos permitidos).
+    """
+    identity = _auth_identity()
+    if identity is None:
+        return None, _json_error(
+            "Unauthorized: usa X-BRIDGE-TOKEN (admin) o user/pass. "
+            "Recomendado: X-USER y X-PASS en headers; query ?user=&pass= solo como fallback.",
+            401,
+        )
+    if identity.get("mode") == "invalid":
+        return None, _json_error(f"Unauthorized: {identity.get('reason')}", 401)
+    return identity, None
+
+
+# ---- Filtros de paths --------------------------------------------------------
+
 def _apply_path_filters(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Filtros soportados por query:
-      - prefix=src
-      - kind=files|dirs|all
-      - q=texto (substring sobre path)
-      - name=main.py (nombre exacto del fichero)
-      - ext=.py  (o py)
-      - glob=**/*.py | *.md | src/*/main.py (fnmatch simple)
-      - min_size, max_size (solo blobs)
-    """
     prefix = (request.args.get("prefix") or "").strip().strip("/")
     kind = (request.args.get("kind") or "files").strip().lower()  # files | dirs | all
     q = (request.args.get("q") or "").strip().lower()
@@ -143,22 +285,18 @@ def _apply_path_filters(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         if kind == "dirs" and typ != "tree":
             continue
-        # kind=all -> no filtra
 
         if q and q not in path.lower():
             continue
 
-        if name:
-            if path.split("/")[-1] != name:
-                continue
+        if name and path.split("/")[-1] != name:
+            continue
 
-        if ext:
-            if not path.endswith(ext):
-                continue
+        if ext and not path.endswith(ext):
+            continue
 
-        if glob_pat:
-            if not fnmatch.fnmatch(path, glob_pat):
-                continue
+        if glob_pat and not fnmatch.fnmatch(path, glob_pat):
+            continue
 
         if typ == "blob":
             if min_size is not None and (size is None or size < min_size):
@@ -175,8 +313,8 @@ def _entries_to_public(entries: List[Dict[str, Any]], limit: int) -> List[Dict[s
     return [
         {
             "path": e.get("path"),
-            "type": e.get("type"),   # blob/tree/commit
-            "size": e.get("size"),   # solo blobs
+            "type": e.get("type"),
+            "size": e.get("size"),
             "sha": e.get("sha"),
             "mode": e.get("mode"),
         }
@@ -184,105 +322,71 @@ def _entries_to_public(entries: List[Dict[str, Any]], limit: int) -> List[Dict[s
     ]
 
 
-def _parse_paths_multi() -> List[str]:
-    """
-    Soporta:
-      ?path=a&path=b&path=c
-      ?paths=a,b,c
-      ?paths_json=["a","b"]
-    """
-    out: List[str] = []
-
-    # repetido path=
-    for p in request.args.getlist("path"):
-        if p and p.strip():
-            out.append(p.strip())
-
-    # paths=a,b,c
-    paths_csv = (request.args.get("paths") or "").strip()
-    if paths_csv:
-        out.extend([p.strip() for p in paths_csv.split(",") if p.strip()])
-
-    # No hacemos JSON parsing aquí para mantener simple/seguro en GET
-    # (si quieres, lo añadimos luego)
-    # Deduplicar preservando orden
-    seen = set()
-    uniq: List[str] = []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
-
-
-def _safe_project_alias(project: str) -> str:
-    project = (project or "").strip()
-    if not project:
-        raise ValueError("Falta project")
-    return project
-
-
 # ---- Endpoints ---------------------------------------------------------------
 
 @bp.get("/projects")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_projects():
     """
-    Lista aliases de proyectos configurados en GITHUB_PROJECTS.
-    Por defecto no revela owner/repo, solo alias y ref.
+    Lista los proyectos a los que el caller tiene acceso.
+    - Con X-BRIDGE-TOKEN válido: lista todos.
+    - Con user/pass: lista solo los permitidos.
     """
+    identity, err = _auth_for_projects_listing()
+    if err:
+        return err
+
+    reveal = _bool_arg("reveal", False)  # revelar owner/repo (solo útil para admin)
     try:
-        projects = parse_project_map()
+        projects_full = parse_projects_full()
     except Exception as e:
         return _json_error(f"GITHUB_PROJECTS inválido: {e}", 500)
 
-    reveal = _bool_arg("reveal", False)  # opcional para ti, con auth
+    if identity["mode"] == "bridge":
+        aliases = list_all_projects()
+    else:
+        aliases = list_projects_for_user(identity["user"])
+
     data = []
-    for alias, cfg in projects.items():
+    for alias in aliases:
+        cfg = projects_full.get(alias, {})
         item = {"project": alias, "ref": cfg.get("ref", "main")}
-        if reveal:
+        if reveal and identity["mode"] == "bridge":
             item["owner"] = cfg.get("owner")
             item["repo"] = cfg.get("repo")
+            item["token_env"] = cfg.get("token_env")
         data.append(item)
 
-    data.sort(key=lambda x: x["project"])
-    return jsonify(ok=True, count=len(data), projects=data)
+    return jsonify(
+        ok=True,
+        auth_mode=identity["mode"],
+        user=identity.get("user"),
+        count=len(data),
+        projects=data,
+    )
 
 
 @bp.get("/paths")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_paths():
-    """
-    Lista paths recursivos de un proyecto alias.
-
-    Ejemplos:
-      /github/paths?project=proyecto_xx
-      /github/paths?project=proyecto_xx&prefix=src
-      /github/paths?project=proyecto_xx&name=main.py
-      /github/paths?project=proyecto_xx&ext=py
-      /github/paths?project=proyecto_xx&glob=**/*.md
-      /github/paths?project=proyecto_xx&q=requirements
-      /github/paths?project=proyecto_xx&kind=dirs
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
+    token_ctx = None
     try:
         project = _safe_project_alias(request.args.get("project", ""))
     except ValueError as e:
         return _json_error(str(e), 400)
 
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
     ref = (request.args.get("ref") or "").strip() or None
-    limit = request.args.get("limit", str(DEFAULT_PATHS_LIMIT))
-    try:
-        limit_n = int(limit)
-    except Exception:
-        return _json_error("limit inválido", 400)
-    limit_n = max(1, min(limit_n, MAX_PATHS_LIMIT))
 
     try:
-        entries, truncated = list_paths_recursive(project=project, token=token, ref=ref)
+        limit_n = _int_arg("limit", DEFAULT_PATHS_LIMIT, min_value=1, max_value=MAX_PATHS_LIMIT)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+
+    try:
+        entries, truncated = list_paths_recursive(project=project, token=gh_token, ref=ref)
         entries = _apply_path_filters(entries)
     except KeyError as e:
         return _json_error(str(e), 404)
@@ -291,18 +395,18 @@ def github_paths():
     except Exception as e:
         return _json_error(f"github error: {e}", 502)
 
-    # Stats básicas antes de recortar
     total_filtered = len(entries)
     files_count = sum(1 for e in entries if e.get("type") == "blob")
     dirs_count = sum(1 for e in entries if e.get("type") == "tree")
-
     entries_public = _entries_to_public(entries, limit_n)
 
     return jsonify(
         ok=True,
         project=project,
         ref=ref,
-        truncated=truncated,          # del árbol GitHub
+        auth_mode=token_ctx["identity"]["mode"],
+        auth_user=token_ctx["identity"].get("user"),
+        truncated=truncated,
         total_filtered=total_filtered,
         returned=len(entries_public),
         limit_applied=limit_n,
@@ -312,29 +416,26 @@ def github_paths():
 
 
 @bp.get("/find")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_find():
-    """
-    Alias de /paths orientado a búsqueda (mismos filtros).
-    Devuelve resultado más compacto.
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
     except ValueError as e:
         return _json_error(str(e), 400)
 
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
     ref = (request.args.get("ref") or "").strip() or None
+
     try:
         limit_n = _int_arg("limit", 200, min_value=1, max_value=5000)
     except ValueError as e:
         return _json_error(str(e), 400)
 
     try:
-        entries, truncated = list_paths_recursive(project=project, token=token, ref=ref)
+        entries, truncated = list_paths_recursive(project=project, token=gh_token, ref=ref)
         entries = _apply_path_filters(entries)
     except KeyError as e:
         return _json_error(str(e), 404)
@@ -343,18 +444,14 @@ def github_find():
     except Exception as e:
         return _json_error(f"github error: {e}", 502)
 
-    items = []
-    for e in entries[:limit_n]:
-        items.append({
-            "path": e.get("path"),
-            "type": e.get("type"),
-            "size": e.get("size"),
-        })
+    items = [{"path": e.get("path"), "type": e.get("type"), "size": e.get("size")} for e in entries[:limit_n]]
 
     return jsonify(
         ok=True,
         project=project,
         ref=ref,
+        auth_mode=token_ctx["identity"]["mode"],
+        auth_user=token_ctx["identity"].get("user"),
         query={
             "q": request.args.get("q"),
             "name": request.args.get("name"),
@@ -371,36 +468,29 @@ def github_find():
 
 
 @bp.get("/file")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_file():
-    """
-    Devuelve contenido de fichero para Claude.
-    Por defecto: texto UTF-8.
-    Si es binario/no UTF-8:
-      - binary=error  -> 415
-      - binary=base64 -> devuelve content en base64 (ojo contexto)
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
         path = _safe_path(request.args.get("path", ""))
     except ValueError as e:
         return _json_error(str(e), 400)
 
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
     ref = (request.args.get("ref") or "").strip() or None
-    binary_mode = (request.args.get("binary") or "error").strip().lower()  # error | base64
+    binary_mode = (request.args.get("binary") or "error").strip().lower()
     include_meta = _bool_arg("meta", True)
     include_line_count = _bool_arg("line_count", False)
 
     try:
-        meta = get_file_meta(project=project, path=path, token=token, ref=ref) if include_meta else {}
-        # Si meta es lista, te han pedido un directorio, no un fichero
+        meta = get_file_meta(project=project, path=path, token=gh_token, ref=ref) if include_meta else {}
         if include_meta and isinstance(meta, list):
             return _json_error("El path es un directorio, no un fichero", 400, path=path)
-        data = get_file_bytes(project=project, path=path, token=token, ref=ref)
+
+        data = get_file_bytes(project=project, path=path, token=gh_token, ref=ref)
     except KeyError as e:
         return _json_error(str(e), 404)
     except Exception as e:
@@ -427,12 +517,12 @@ def github_file():
         }
         if include_line_count:
             payload["total_lines"] = len(_split_lines(text))
-        if include_meta:
+        if include_meta and isinstance(meta, dict):
             payload["meta"] = {
                 "sha": meta.get("sha"),
                 "name": meta.get("name"),
                 "html_url": meta.get("html_url"),
-                "download_url": meta.get("download_url"),  # temporal
+                "download_url": meta.get("download_url"),
                 "type": meta.get("type"),
             }
         return jsonify(payload)
@@ -447,36 +537,21 @@ def github_file():
             "encoding": "base64",
             "content": base64.b64encode(data).decode("ascii"),
         }
-        if include_meta:
+        if include_meta and isinstance(meta, dict):
             payload["meta"] = {
-                "sha": meta.get("sha") if isinstance(meta, dict) else None,
-                "name": meta.get("name") if isinstance(meta, dict) else None,
-                "html_url": meta.get("html_url") if isinstance(meta, dict) else None,
-                "download_url": meta.get("download_url") if isinstance(meta, dict) else None,
-                "type": meta.get("type") if isinstance(meta, dict) else None,
+                "sha": meta.get("sha"),
+                "name": meta.get("name"),
+                "html_url": meta.get("html_url"),
+                "download_url": meta.get("download_url"),
+                "type": meta.get("type"),
             }
         return jsonify(payload)
 
-    return _json_error(
-        "Fichero binario o no UTF-8. Usa binary=base64 o /github/download",
-        415,
-        path=path,
-        size=len(data),
-    )
+    return _json_error("Fichero binario o no UTF-8. Usa binary=base64 o /github/download", 415, path=path, size=len(data))
 
 
 @bp.get("/file_lines")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_file_lines():
-    """
-    Devuelve un rango de líneas (1-based, inclusive) de un fichero texto UTF-8.
-    Ej:
-      /github/file_lines?project=xx&path=src/main.py&start=1&end=200&numbered=1
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
         path = _safe_path(request.args.get("path", ""))
@@ -492,11 +567,16 @@ def github_file_lines():
     if span > MAX_LINES_SPAN:
         return _json_error(f"Demasiadas líneas pedidas ({span}). Máximo {MAX_LINES_SPAN}", 400)
 
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
     ref = (request.args.get("ref") or "").strip() or None
     numbered = _bool_arg("numbered", False)
 
     try:
-        data = get_file_bytes(project=project, path=path, token=token, ref=ref)
+        data = get_file_bytes(project=project, path=path, token=gh_token, ref=ref)
     except KeyError as e:
         return _json_error(str(e), 404)
     except Exception as e:
@@ -550,7 +630,7 @@ def github_file_lines():
         )
 
     start_idx = start - 1
-    end_idx_excl = min(total_lines, end)  # end es inclusive (1-based)
+    end_idx_excl = min(total_lines, end)
     selected = lines[start_idx:end_idx_excl]
 
     actual_start = start_idx + 1 if selected else None
@@ -578,17 +658,7 @@ def github_file_lines():
 
 
 @bp.get("/file_chunk")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_file_chunk():
-    """
-    Lee por chunks de líneas.
-    chunk=0 y chunk_lines=200 -> líneas 1..200
-    chunk=1 -> 201..400
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
         path = _safe_path(request.args.get("path", ""))
@@ -597,16 +667,19 @@ def github_file_chunk():
     except ValueError as e:
         return _json_error(str(e), 400)
 
-    # Convertir chunk a rango 1-based inclusive
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
+
     start = chunk * chunk_lines + 1
     end = start + chunk_lines - 1
-
-    # Reutilizamos la lógica central de file_lines a nivel local (sin duplicar endpoint call)
     ref = (request.args.get("ref") or "").strip() or None
     numbered = _bool_arg("numbered", False)
 
     try:
-        data = get_file_bytes(project=project, path=path, token=token, ref=ref)
+        data = get_file_bytes(project=project, path=path, token=gh_token, ref=ref)
     except KeyError as e:
         return _json_error(str(e), 404)
     except Exception as e:
@@ -696,30 +769,19 @@ def github_file_chunk():
 
 
 @bp.get("/readmany")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_readmany():
-    """
-    Lee varios ficheros de golpe (ideal para Claude cuando ya conoce los paths).
-    Parámetros:
-      - project (required)
-      - path=... repetido, o paths=a,b,c
-      - ref (optional)
-      - binary=error|skip|base64   (default=skip)
-      - meta=1|0
-      - numbered=1|0  (si texto, añade líneas numeradas)
-      - max_files (<=20)
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
     except ValueError as e:
         return _json_error(str(e), 400)
 
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
     ref = (request.args.get("ref") or "").strip() or None
-    binary_mode = (request.args.get("binary") or "skip").strip().lower()  # error | skip | base64
+    binary_mode = (request.args.get("binary") or "skip").strip().lower()  # error|skip|base64
     include_meta = _bool_arg("meta", False)
     numbered = _bool_arg("numbered", False)
 
@@ -732,10 +794,8 @@ def github_readmany():
     if not raw_paths:
         return _json_error("Falta path (repetido) o paths=a,b,c", 400)
 
-    paths: List[str] = []
     try:
-        for p in raw_paths[:max_files]:
-            paths.append(_safe_path(p))
+        paths = [_safe_path(p) for p in raw_paths[:max_files]]
     except ValueError as e:
         return _json_error(str(e), 400)
 
@@ -745,20 +805,16 @@ def github_readmany():
     for path in paths:
         item: Dict[str, Any] = {"path": path}
         try:
-            meta = get_file_meta(project=project, path=path, token=token, ref=ref) if include_meta else {}
+            meta = get_file_meta(project=project, path=path, token=gh_token, ref=ref) if include_meta else {}
             if include_meta and isinstance(meta, list):
                 item.update(ok=False, error="Es un directorio, no un fichero")
                 results.append(item)
                 continue
 
-            data = get_file_bytes(project=project, path=path, token=token, ref=ref)
+            data = get_file_bytes(project=project, path=path, token=gh_token, ref=ref)
             total_bytes += len(data)
             if total_bytes > MAX_READMANY_TOTAL_BYTES:
-                item.update(
-                    ok=False,
-                    error=f"Límite total de /readmany excedido ({MAX_READMANY_TOTAL_BYTES} bytes)",
-                    size=len(data),
-                )
+                item.update(ok=False, error=f"Límite total de /readmany excedido ({MAX_READMANY_TOTAL_BYTES} bytes)", size=len(data))
                 results.append(item)
                 break
 
@@ -774,12 +830,7 @@ def github_readmany():
                 elif binary_mode == "skip":
                     item.update(ok=False, size=len(data), skipped=True, error="Binario/no-UTF8")
                 elif binary_mode == "base64":
-                    item.update(
-                        ok=True,
-                        size=len(data),
-                        encoding="base64",
-                        content=base64.b64encode(data).decode("ascii"),
-                    )
+                    item.update(ok=True, size=len(data), encoding="base64", content=base64.b64encode(data).decode("ascii"))
                 else:
                     item.update(ok=False, size=len(data), error=f"binary inválido: {binary_mode}")
 
@@ -811,28 +862,18 @@ def github_readmany():
 
 
 @bp.get("/find_in_file")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_find_in_file():
-    """
-    Busca texto dentro de un fichero y devuelve hits con contexto de líneas.
-    Parámetros:
-      - project, path
-      - q (texto a buscar) [required]
-      - ref (optional)
-      - ignore_case=1 (default=1)
-      - context=3 (líneas antes/después)
-      - max_hits=20
-      - numbered=1 (default=1)
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
         path = _safe_path(request.args.get("path", ""))
     except ValueError as e:
         return _json_error(str(e), 400)
+
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
 
     q = (request.args.get("q") or "").strip()
     if not q:
@@ -849,7 +890,7 @@ def github_find_in_file():
         return _json_error(str(e), 400)
 
     try:
-        data = get_file_bytes(project=project, path=path, token=token, ref=ref)
+        data = get_file_bytes(project=project, path=path, token=gh_token, ref=ref)
     except KeyError as e:
         return _json_error(str(e), 404)
     except Exception as e:
@@ -912,26 +953,22 @@ def github_find_in_file():
 
 
 @bp.get("/download")
-@require_token(header_name="X-BRIDGE-TOKEN", env_attr="BRIDGE_TOKEN")
 def github_download():
-    """
-    Proxy raw/binario para navegador/scripts.
-    Devuelve attachment con el nombre del fichero.
-    """
-    token = _get_bridge_token()
-    if not token:
-        return _json_error("Falta GITHUB_TOKEN", 500)
-
     try:
         project = _safe_project_alias(request.args.get("project", ""))
         path = _safe_path(request.args.get("path", ""))
     except ValueError as e:
         return _json_error(str(e), 400)
 
+    token_ctx, err = _resolve_project_access(project)
+    if err:
+        return err
+
+    gh_token = token_ctx["github_token"]
     ref = (request.args.get("ref") or "").strip() or None
 
     try:
-        data = get_file_bytes(project=project, path=path, token=token, ref=ref)
+        data = get_file_bytes(project=project, path=path, token=gh_token, ref=ref)
     except KeyError as e:
         return _json_error(str(e), 404)
     except Exception as e:
