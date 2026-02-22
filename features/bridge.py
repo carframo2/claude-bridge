@@ -100,10 +100,11 @@ def api_message():
 
     # (opcional) enforce allow-lists si están definidas
     s = current_app.config["SETTINGS"]
-    if provider == "groq" and s.ALLOWED_MODELS_GROQ and model not in s.ALLOWED_MODELS_GROQ:
-        return jsonify({"content": f"(model no permitido groq): {model}"}), 400
-    if provider == "openai" and s.ALLOWED_MODELS_OPENAI and model not in s.ALLOWED_MODELS_OPENAI:
-        return jsonify({"content": f"(model no permitido openai): {model}"}), 400
+    # De momento permitimos cualquier modelo
+    #if provider == "groq" and s.ALLOWED_MODELS_GROQ and model not in s.ALLOWED_MODELS_GROQ:
+    #    return jsonify({"content": f"(model no permitido groq): {model}"}), 400
+    #if provider == "openai" and s.ALLOWED_MODELS_OPENAI and model not in s.ALLOWED_MODELS_OPENAI:
+    #    return jsonify({"content": f"(model no permitido openai): {model}"}), 400
 
     text, context = _read_text_from_request()
     if not (text or context):
