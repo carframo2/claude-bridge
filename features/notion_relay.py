@@ -16,6 +16,10 @@ ENV esperadas:
 - NOTION_API_VERSION            (opcional, default: 2025-09-03)
 - NOTION_DEFAULT_PAGE_TITLE     (opcional, default: test_bridge)
 
+ENV opcionales para evitar self-call (rewrite de host):
+- RELAY_ORIGEN                  (ej: claude-bridge-i43j.onrender.com)
+- RELAY_DESTINO                 (ej: claude-bridge2.onrender.com)
+
 Ejemplos:
 - /notion/relay_test_bridge?run=0
 - /notion/relay_test_bridge?max_urls=3&timeout=20
@@ -29,7 +33,7 @@ import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error as urlerror
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from flask import Blueprint, current_app, jsonify, request
@@ -41,7 +45,7 @@ bp = Blueprint("notion_relay", __name__, url_prefix="/notion")
 NOTION_API_BASE = "https://api.notion.com/v1"
 DEFAULT_NOTION_API_VERSION = "2025-09-03"
 
-# regex simple y práctico para URLs en texto
+# Regex simple y práctico para URLs en texto
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 
 # Tipos de block que suelen tener rich_text
@@ -239,7 +243,6 @@ def _extract_page_title(page_obj: Dict[str, Any]) -> str:
                 return txt.strip()
     # Fallbacks
     if page_obj.get("title"):
-        # Algunos payloads pueden incluir title directamente
         t = page_obj.get("title")
         if isinstance(t, list):
             txt = "".join((p.get("plain_text") or "") for p in t if isinstance(p, dict))
@@ -362,15 +365,11 @@ def _extract_urls_from_block(block: Dict[str, Any]) -> List[str]:
         urls.extend(_collect_urls_from_rich_text(data.get("rich_text") or []))
 
     # Bloques con campo URL directo
-    for field in ("url",):
-        v = data.get(field)
-        if isinstance(v, str) and v.startswith(("http://", "https://")):
-            urls.append(v)
+    v = data.get("url")
+    if isinstance(v, str) and v.startswith(("http://", "https://")):
+        urls.append(v)
 
-    # Algunos bloques embed/bookmark/link_preview llevan url directo
-    # (ya cubierto por data["url"], pero mantenemos por claridad)
-
-    # Archivos externos en image/file/pdf/video/audio
+    # Archivos externos (image/file/pdf/video/audio)
     if btype in ("image", "file", "pdf", "video", "audio"):
         file_obj = data.get("external") or {}
         ext_url = file_obj.get("url")
@@ -382,12 +381,9 @@ def _extract_urls_from_block(block: Dict[str, Any]) -> List[str]:
         if isinstance(file_url, str) and file_url.startswith(("http://", "https://")):
             urls.append(file_url)
 
-        # caption también puede contener links
         caption = data.get("caption") or []
         if isinstance(caption, list):
             urls.extend(_collect_urls_from_rich_text(caption))
-
-    # equation / callout icon etc. no necesarios aquí
 
     return urls
 
@@ -400,8 +396,92 @@ def _extract_urls_from_blocks(blocks: List[Dict[str, Any]]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Replay URLs helpers
+# Relay URLs helpers (HTTP + rewrite de host para evitar self-call)
 # ---------------------------------------------------------------------------
+
+def _normalize_host_for_compare(host: Optional[str]) -> str:
+    if not host:
+        return ""
+    h = host.strip().lower()
+    if h.startswith("http://") or h.startswith("https://"):
+        try:
+            h = urlparse(h).netloc.lower()
+        except Exception:
+            pass
+    return h.strip("/")
+
+
+def _relay_rewrite_config() -> Dict[str, Any]:
+    origin = (
+        _get_settings_attr("RELAY_ORIGEN", None)
+        or os.environ.get("RELAY_ORIGEN", "")
+    )
+    dest = (
+        _get_settings_attr("RELAY_DESTINO", None)
+        or os.environ.get("RELAY_DESTINO", "")
+    )
+
+    origin_h = _normalize_host_for_compare(origin)
+    dest_h = _normalize_host_for_compare(dest)
+    req_h = _normalize_host_for_compare(request.host)
+
+    enabled = bool(origin_h and dest_h and origin_h != dest_h)
+
+    return {
+        "enabled": enabled,
+        "origin_host": origin_h,
+        "dest_host": dest_h,
+        "request_host": req_h,
+    }
+
+
+def _rewrite_url_for_relay(url: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Reescribe SOLO el host (netloc) si coincide con RELAY_ORIGEN.
+    Además, para evitar rebotes/loops, solo reescribe cuando la request actual
+    entra por el bridge de origen.
+    """
+    cfg = _relay_rewrite_config()
+    info = {
+        "rewritten": False,
+        "reason": None,
+        "from_host": None,
+        "to_host": None,
+    }
+
+    if not cfg["enabled"]:
+        info["reason"] = "disabled_or_invalid_env"
+        return url, info
+
+    # Evita que el bridge destino vuelva a reescribir si alguien llama allí por error
+    if cfg["request_host"] != cfg["origin_host"]:
+        info["reason"] = "request_not_on_origin_host"
+        return url, info
+
+    try:
+        sp = urlsplit(url)
+    except Exception:
+        info["reason"] = "invalid_url"
+        return url, info
+
+    if not sp.scheme or not sp.netloc:
+        info["reason"] = "missing_scheme_or_host"
+        return url, info
+
+    current_host = _normalize_host_for_compare(sp.netloc)
+    if current_host != cfg["origin_host"]:
+        info["reason"] = "url_host_not_origin"
+        return url, info
+
+    rewritten = urlunsplit((sp.scheme, cfg["dest_host"], sp.path, sp.query, sp.fragment))
+    info.update({
+        "rewritten": True,
+        "reason": "ok",
+        "from_host": cfg["origin_host"],
+        "to_host": cfg["dest_host"],
+    })
+    return rewritten, info
+
 
 def _relay_get_url(url: str, *, timeout: int = 20, body_preview_bytes: int = 1200) -> Dict[str, Any]:
     """
@@ -504,6 +584,7 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
 
     run = _bool_arg("run", True)
     include_blocks_debug = _bool_arg("include_blocks_debug", False)
+    include_rewrite_debug = _bool_arg("include_rewrite_debug", False)
 
     page_id = (request.args.get("page_id") or "").strip()
     page_title = (request.args.get("page_title") or "").strip()
@@ -519,7 +600,6 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     only_contains = (request.args.get("only_contains") or "").strip() or None
 
     # Filtro práctico para evitar relanzar URLs externas si queréis:
-    # host_equals toma precedencia si viene
     host_equals = (request.args.get("host_equals") or "").strip() or None
     only_current_host = _bool_arg("only_current_host", False)
     if only_current_host and not host_equals:
@@ -531,7 +611,7 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
 
     try:
         if page_id:
-            # No hace falta "retrieve page" para leer contenido; page_id sirve como block_id.
+            # No hace falta retrieve page para leer contenido; page_id sirve como block_id.
             page_lookup["mode"] = "page_id"
             page_lookup["page_id"] = page_id
         else:
@@ -564,11 +644,31 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     )
     urls_filtered = urls_filtered[:max_urls]
 
-    # 4) Relay (opcional)
+    # 4) Relay (opcional) con rewrite de host
     relay_results: List[Dict[str, Any]] = []
+    rewrite_applied = 0
+    rewrite_debug: List[Dict[str, Any]] = []
+
     if run:
         for u in urls_filtered:
-            relay_results.append(_relay_get_url(u, timeout=timeout, body_preview_bytes=body_preview_bytes))
+            relay_url, rw = _rewrite_url_for_relay(u)
+            if rw.get("rewritten"):
+                rewrite_applied += 1
+
+            res = _relay_get_url(relay_url, timeout=timeout, body_preview_bytes=body_preview_bytes)
+            res["source_url"] = u
+            res["relayed_url"] = relay_url
+            res["host_rewrite"] = rw
+            relay_results.append(res)
+
+            rewrite_debug.append({
+                "source_url": u,
+                "relayed_url": relay_url,
+                "rewritten": rw.get("rewritten", False),
+                "reason": rw.get("reason"),
+            })
+
+    rewrite_cfg = _relay_rewrite_config()
 
     resp: Dict[str, Any] = {
         "ok": True,
@@ -585,6 +685,13 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             "host_equals": host_equals,
             "only_current_host": only_current_host,
             "max_urls": max_urls,
+        },
+        "rewrite": {
+            "enabled": rewrite_cfg["enabled"],
+            "origin_host": rewrite_cfg["origin_host"],
+            "dest_host": rewrite_cfg["dest_host"],
+            "request_host": rewrite_cfg["request_host"],
+            "applied_count": rewrite_applied if run else 0,
         },
         "urls": {
             "found_total": len(urls_all),
@@ -603,6 +710,9 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             {"id": b.get("id"), "type": b.get("type"), "has_children": b.get("has_children", False)}
             for b in blocks[:500]
         ]
+
+    if include_rewrite_debug:
+        resp["rewrite_debug"] = rewrite_debug
 
     return jsonify(resp)
 
