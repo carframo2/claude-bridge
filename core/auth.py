@@ -9,6 +9,8 @@ def require_token(header_name: str = "X-BRIDGE-TOKEN", env_attr: str = "BRIDGE_T
     def deco(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            if request.method == "OPTIONS":
+                return ("", 204)
             s = current_app.config["SETTINGS"]
             expected = getattr(s, env_attr, "") or ""
             expected = expected.strip()
@@ -34,6 +36,8 @@ def require_upload_secret(fn):
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return ("", 204)        
         s = current_app.config["SETTINGS"]
         expected = (s.UPLOAD_SECRET or s.BRIDGE_TOKEN or "").strip()
         if not expected:
