@@ -581,6 +581,7 @@ def _resolve_response_page(
     """
     Devuelve (page_info, error_msg)
     page_info: {"page_id","title","mode"}
+    Para la página de respuesta exigimos match exacto para evitar escribir en la página equivocada.
     """
     if response_page_id:
         return {
@@ -592,15 +593,22 @@ def _resolve_response_page(
     if not response_page_title:
         return None, "Falta response_page_title y response_page_id"
 
-    p = _find_page_by_title(response_page_title, timeout=timeout)
-    if not p:
-        return None, f"Página de respuesta no encontrada: {response_page_title}"
+    pages = _notion_search_pages(response_page_title, timeout=timeout)
+    title_norm = response_page_title.strip().lower()
 
-    return {
-        "page_id": p.get("id"),
-        "title": _extract_page_title(p) or response_page_title,
-        "mode": "search_title",
-    }, None
+    # Solo exact match
+    for p in pages:
+        t = (_extract_page_title(p) or "").strip().lower()
+        if t == title_norm:
+            return {
+                "page_id": p.get("id"),
+                "title": _extract_page_title(p) or response_page_title,
+                "mode": "search_title_exact",
+            }, None
+
+    # Nada de fallback al primer resultado: mejor fallar que escribir donde no toca
+    candidates = [_extract_page_title(p) for p in pages[:10]]
+    return None, f"Página de respuesta no encontrada (match exacto): {response_page_title}. Candidates={candidates}"
 
 
 # ---------------------------------------------------------------------------
