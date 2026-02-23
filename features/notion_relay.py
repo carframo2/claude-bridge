@@ -27,14 +27,12 @@ ENV opcionales para evitar self-call (rewrite de host):
 - RELAY_DESTINO                     (ej: claude-bridge2.onrender.com)
 
 ENV opcionales para respuesta en Notion:
-- NOTION_RESPONSE_PAGE_ID           (opcional, page_id fijo de destino para respuestas)
 - NOTION_RESPONSE_PAGE_TITLE        (opcional, default: test_bridge_respuesta)
 - RESPUESTA_LEER_NOTION             (opcional, texto que se devuelve a Claude)
 
 Params útiles:
 - run=1|0
-- debug=1|0                     (default: 0; si 0 intenta respuesta mínima)
-- response_in_notion=1|0          (default: 1)
+- response_in_notion=1|0
 - response_page_title=...
 - response_page_id=...
 - response_mode=replace|append
@@ -52,7 +50,7 @@ from urllib import error as urlerror
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from flask import Blueprint, Response, current_app, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from core.auth import require_token
 
@@ -87,8 +85,6 @@ NOTION_MAX_CHILDREN_PER_APPEND = 100
 NOTION_TEXT_CHUNK = 1800  # conservador (rich_text text content suele tener límite por segmento)
 DEFAULT_RESPONSE_JSON_MAX_CHARS = 20000
 MAX_RESPONSE_JSON_MAX_CHARS = 200000
-DEFAULT_FULL_BODY_BYTES = 2 * 1024 * 1024  # para modo minimal (texto/JSON)
-MAX_FULL_BODY_BYTES = 10 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -170,35 +166,6 @@ def _chunks(s: str, size: int) -> List[str]:
     if not s:
         return [""]
     return [s[i:i + size] for i in range(0, len(s), size)]
-
-
-def _is_text_like_content_type(content_type: Optional[str]) -> bool:
-    ct = (content_type or "").lower()
-    if not ct:
-        return True
-    return (
-        ct.startswith("text/")
-        or "json" in ct
-        or "xml" in ct
-        or "javascript" in ct
-        or "x-www-form-urlencoded" in ct
-    )
-
-
-def _minimal_plain_response(text: str, *, status: int = 200, content_type: Optional[str] = "text/plain; charset=utf-8"):
-    resp = Response(text or "", status=status)
-    if content_type:
-        resp.headers["Content-Type"] = content_type
-    resp.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    return resp
-
-
-def _pick_primary_relay_result(relay_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not relay_results:
-        return None
-    return relay_results[0]
 
 
 # ---------------------------------------------------------------------------
@@ -811,14 +778,7 @@ def _relay_version_seed(urls_filtered: List[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-def _relay_get_url(
-    url: str,
-    *,
-    timeout: int = 20,
-    body_preview_bytes: int = 1200,
-    capture_full_body: bool = False,
-    full_body_max_bytes: int = DEFAULT_FULL_BODY_BYTES,
-) -> Dict[str, Any]:
+def _relay_get_url(url: str, *, timeout: int = 20, body_preview_bytes: int = 1200) -> Dict[str, Any]:
     started = time.time()
     req = Request(
         url=url,
@@ -832,61 +792,25 @@ def _relay_get_url(
         },
     )
 
-    def _read_limited(resp, n: int) -> Tuple[bytes, bool]:
-        if n <= 0:
-            return b"", False
-        raw = resp.read(n + 1)
-        return (raw[:n], len(raw) > n)
-
-    def _pack_ok(resp, raw_preview: bytes, *, raw_full: Optional[bytes] = None, full_truncated: Optional[bool] = None):
-        elapsed_ms = round((time.time() - started) * 1000, 1)
-        headers = dict(resp.headers.items())
-        ct = headers.get("Content-Type")
-        out = {
-            "ok": True,
-            "url": url,
-            "status": getattr(resp, "status", 200),
-            "final_url": getattr(resp, "geturl", lambda: url)(),
-            "elapsed_ms": elapsed_ms,
-            "content_type": ct,
-            "content_length": headers.get("Content-Length"),
-            "body_preview": raw_preview.decode("utf-8", errors="replace"),
-        }
-        if raw_full is not None:
-            out["body_text_full"] = raw_full.decode("utf-8", errors="replace")
-            out["body_full_truncated"] = bool(full_truncated)
-            out["body_full_bytes"] = len(raw_full)
-        return out
-
     try:
         with urlopen(req, timeout=timeout) as resp:
-            if capture_full_body:
-                max_n = max(1, min(int(full_body_max_bytes or DEFAULT_FULL_BODY_BYTES), MAX_FULL_BODY_BYTES))
-                raw_full, truncated = _read_limited(resp, max_n)
-                raw_preview = raw_full[:body_preview_bytes]
-                return _pack_ok(resp, raw_preview, raw_full=raw_full, full_truncated=truncated)
-            raw_preview = resp.read(body_preview_bytes)
-            return _pack_ok(resp, raw_preview)
-    except urlerror.HTTPError as e:
-        elapsed_ms = round((time.time() - started) * 1000, 1)
-        if capture_full_body and hasattr(e, "read"):
-            max_n = max(1, min(int(full_body_max_bytes or DEFAULT_FULL_BODY_BYTES), MAX_FULL_BODY_BYTES))
-            raw_full = e.read(max_n + 1)
-            truncated = len(raw_full) > max_n
-            raw_full = raw_full[:max_n]
-            raw_preview = raw_full[:body_preview_bytes]
+            status = getattr(resp, "status", 200)
+            raw = resp.read(body_preview_bytes)
+            elapsed_ms = round((time.time() - started) * 1000, 1)
+            headers = dict(resp.headers.items())
             return {
-                "ok": False,
+                "ok": True,
                 "url": url,
-                "status": e.code,
+                "status": status,
+                "final_url": getattr(resp, "geturl", lambda: url)(),
                 "elapsed_ms": elapsed_ms,
-                "error": f"HTTPError {e.code}",
-                "body_preview": raw_preview.decode("utf-8", errors="replace"),
-                "body_text_full": raw_full.decode("utf-8", errors="replace"),
-                "body_full_truncated": bool(truncated),
-                "body_full_bytes": len(raw_full),
+                "content_type": headers.get("Content-Type"),
+                "content_length": headers.get("Content-Length"),
+                "body_preview": raw.decode("utf-8", errors="replace"),
             }
+    except urlerror.HTTPError as e:
         raw = e.read(body_preview_bytes) if hasattr(e, "read") else b""
+        elapsed_ms = round((time.time() - started) * 1000, 1)
         return {
             "ok": False,
             "url": url,
@@ -971,10 +895,9 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
 
     try:
         timeout = _int_arg("timeout", 20, min_value=1, max_value=120)
-        max_urls = _int_arg("max_urls", 1, min_value=1, max_value=200)
+        max_urls = _int_arg("max_urls", 20, min_value=1, max_value=200)
         max_blocks = _int_arg("max_blocks", 2000, min_value=1, max_value=20000)
         body_preview_bytes = _int_arg("body_preview_bytes", 1200, min_value=100, max_value=20000)
-        full_body_max_bytes = _int_arg("full_body_max_bytes", DEFAULT_FULL_BODY_BYTES, min_value=1024, max_value=MAX_FULL_BODY_BYTES)
         response_json_max_chars = _int_arg(
             "response_max_json_chars",
             DEFAULT_RESPONSE_JSON_MAX_CHARS,
@@ -985,10 +908,9 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
         return _json_error(str(e), 400)
 
     run = _bool_arg("run", True)
-    debug_mode = _bool_arg("debug", False)
-    include_blocks_debug = _bool_arg("include_blocks_debug", debug_mode)
-    include_rewrite_debug = _bool_arg("include_rewrite_debug", debug_mode)
-    include_freshness_debug = _bool_arg("include_freshness_debug", debug_mode)
+    include_blocks_debug = _bool_arg("include_blocks_debug", False)
+    include_rewrite_debug = _bool_arg("include_rewrite_debug", False)
+    include_freshness_debug = _bool_arg("include_freshness_debug", True)
 
     # Cache-busting interno (no depende del cliente)
     relay_cache_bust = _bool_arg("relay_cache_bust", True)
@@ -997,15 +919,12 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
         relay_cache_bust_mode = "version"
 
     # Nuevo: guardar respuesta en Notion para esquivar caché cliente
-    response_in_notion = _bool_arg("response_in_notion", True)
+    response_in_notion = _bool_arg("response_in_notion", False)
     response_mode = _str_arg("response_mode", "replace").lower()
     if response_mode not in ("replace", "append"):
         response_mode = "replace"
 
-    response_page_id = _str_arg("response_page_id", "") or (
-        _get_settings_attr("NOTION_RESPONSE_PAGE_ID", None)
-        or os.environ.get("NOTION_RESPONSE_PAGE_ID", "")
-    ).strip()
+    response_page_id = _str_arg("response_page_id", "")
     response_page_title = _str_arg(
         "response_page_title",
         _get_settings_attr("NOTION_RESPONSE_PAGE_TITLE", None)
@@ -1013,7 +932,7 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
         or "test_bridge_respuesta",
     )
 
-    response_include_full_json = _bool_arg("response_include_full_json", debug_mode)
+    response_include_full_json = _bool_arg("response_include_full_json", True)
 
     response_notice = (
         _get_settings_attr("RESPUESTA_LEER_NOTION", None)
@@ -1099,14 +1018,7 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
                 else:
                     relay_url = _append_query_param(relay_url, "_relay_v", relay_version)
 
-            capture_full_body = (not debug_mode)
-            res = _relay_get_url(
-                relay_url,
-                timeout=timeout,
-                body_preview_bytes=body_preview_bytes,
-                capture_full_body=capture_full_body,
-                full_body_max_bytes=full_body_max_bytes,
-            )
+            res = _relay_get_url(relay_url, timeout=timeout, body_preview_bytes=body_preview_bytes)
             res["source_url"] = u
             res["relayed_url"] = relay_url
             res["host_rewrite"] = rw
@@ -1157,31 +1069,22 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
                 "title": page_lookup.get("page_title") or page_title or "",
             }
 
-            if debug_mode:
-                blocks_to_write = _compose_notion_report_blocks(
-                    source_page_info=source_page_info,
-                    relay_results=relay_results_sanitized,
-                    response_notice=response_notice,
-                    served_at_ms=served_at_ms,
-                    relay_request_id=relay_request_id,
-                    relay_version=relay_version,
-                    rewrite_info=rewrite_info,
-                    response_in_notion_params={
-                        "enabled": True,
-                        "response_mode": response_mode,
-                        "response_include_full_json": response_include_full_json,
-                    },
-                    include_full_json=response_include_full_json,
-                    response_json_max_chars=response_json_max_chars,
-                )
-            else:
-                primary = _pick_primary_relay_result(relay_results)
-                raw_text = ""
-                if primary:
-                    raw_text = primary.get("body_text_full")
-                    if raw_text is None:
-                        raw_text = primary.get("body_preview") or ""
-                blocks_to_write = _text_to_paragraph_blocks(raw_text or "", max_chunk=NOTION_TEXT_CHUNK)
+            blocks_to_write = _compose_notion_report_blocks(
+                source_page_info=source_page_info,
+                relay_results=relay_results_sanitized,
+                response_notice=response_notice,
+                served_at_ms=served_at_ms,
+                relay_request_id=relay_request_id,
+                relay_version=relay_version,
+                rewrite_info=rewrite_info,
+                response_in_notion_params={
+                    "enabled": True,
+                    "response_mode": response_mode,
+                    "response_include_full_json": response_include_full_json,
+                },
+                include_full_json=response_include_full_json,
+                response_json_max_chars=response_json_max_chars,
+            )
 
             cleared = None
             if response_mode == "replace":
@@ -1202,59 +1105,8 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             })
 
     # 6) Respuesta final
-    # Si usamos Notion como pivote y run=1, Claude recibe siempre solo el aviso.
-    # El contenido real (raw o debug rico) se escribe en la página de respuesta.
-    if run and response_in_notion:
-        if notion_response_write.get("ok") is False:
-            return _json_error(
-                "Error escribiendo respuesta en Notion",
-                502,
-                relay_request_id=relay_request_id,
-                notion_write=notion_response_write,
-            )
-        response = _minimal_plain_response(response_notice, status=200, content_type="text/plain; charset=utf-8")
-        response.headers["X-Relay-Request-Id"] = relay_request_id
-        response.headers["X-Relay-Served-At-Ms"] = str(served_at_ms)
-        return response
-
-    # Modo ahorro de tokens (default): si NO usamos Notion pivote, devolver cuerpo crudo del destino.
-    if run and not debug_mode:
-        primary = _pick_primary_relay_result(relay_results)
-
-        # response_in_notion=0 => devolver cuerpo crudo del destino (solo si hay 1 resultado)
-        if primary and len(relay_results) == 1:
-            body_text = primary.get("body_text_full")
-            if body_text is None:
-                body_text = primary.get("body_preview") or ""
-
-            status_code = primary.get("status") or (200 if primary.get("ok") else 502)
-            ct = primary.get("content_type") or "text/plain; charset=utf-8"
-            if not _is_text_like_content_type(ct):
-                ct = "text/plain; charset=utf-8"
-
-            response = _minimal_plain_response(body_text, status=int(status_code), content_type=ct)
-            response.headers["X-Relay-Request-Id"] = relay_request_id
-            response.headers["X-Relay-Served-At-Ms"] = str(served_at_ms)
-            if primary.get("body_full_truncated"):
-                response.headers["X-Relay-Body-Truncated"] = "1"
-            return response
-
-        # Sin resultado único => fallback mínimo JSON
-        fallback = jsonify({
-            "ok": True,
-            "run": run,
-            "response_in_notion": False,
-            "relay_count": len(relay_results),
-            "message": "No hay resultado único para devolver en modo raw",
-        })
-        fallback.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
-        fallback.headers["Pragma"] = "no-cache"
-        fallback.headers["Expires"] = "0"
-        fallback.headers["X-Relay-Request-Id"] = relay_request_id
-        fallback.headers["X-Relay-Served-At-Ms"] = str(served_at_ms)
-        return fallback
-
-    # debug=1 (o run=0): salida rica JSON (comportamiento legado / diagnóstico)
+    # Si response_in_notion=true, devolvemos el mensaje fijo para Claude y resumimos la carga,
+    # para no depender de leer aquí el body (que puede venir cacheado en cliente).
     relay_public_results: List[Dict[str, Any]]
     if response_in_notion:
         relay_public_results = [
@@ -1274,7 +1126,6 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     resp: Dict[str, Any] = {
         "ok": True,
         "feature": "notion_relay",
-        "debug": True if debug_mode else False,
         "notion": {
             "api_version": _notion_version(),
             "page_lookup": page_lookup,
