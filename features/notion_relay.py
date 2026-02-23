@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Feature: notion_relay
+Feature: notion_relay (v3)
 Lee una página de Notion (por título o page_id), extrae URLs y las relanza por GET.
 
 Endpoints (GET):
@@ -20,20 +20,28 @@ ENV opcionales para evitar self-call (rewrite de host):
 - RELAY_ORIGEN                  (ej: claude-bridge-i43j.onrender.com)
 - RELAY_DESTINO                 (ej: claude-bridge2.onrender.com)
 
+Notas de caché:
+- El cliente (Claude) puede repetir siempre la misma URL del relay.
+- Para evitar resultados viejos:
+  1) el relay añade headers anti-caché en SU respuesta
+  2) el relay añade internamente _relay_v / _relay_cb a las URLs que relanza
+     (sin que el cliente tenga que cambiar nada)
+
 Ejemplos:
 - /notion/relay_test_bridge?run=0
-- /notion/relay_test_bridge?max_urls=3&timeout=20
-- /notion/relay_urls?page_title=test_bridge&url_prefix=https://claude-bridge-i43j.onrender.com/&run=1
-- /notion/relay_urls?page_id=<uuid>&only_contains=/api/message
+- /notion/relay_test_bridge?run=1&token=...
+- /notion/relay_test_bridge?only_current_host=1&only_contains=/api/message&run=1&token=...
+- /notion/relay_test_bridge?run=1&include_rewrite_debug=1&include_freshness_debug=1
 """
 
+import hashlib
 import json
 import os
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error as urlerror
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from flask import Blueprint, current_app, jsonify, request
@@ -74,7 +82,12 @@ RICH_TEXT_BLOCK_TYPES = {
 def _json_error(msg: str, status: int = 400, **extra):
     payload = {"ok": False, "error": msg}
     payload.update(extra)
-    return jsonify(payload), status
+    resp = jsonify(payload)
+    # Anti-caché también en errores (útil para depurar desde Claude)
+    resp.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp, status
 
 
 def _bool_arg(name: str, default: bool = False) -> bool:
@@ -95,6 +108,10 @@ def _int_arg(name: str, default: int, min_value: Optional[int] = None, max_value
     if max_value is not None and n > max_value:
         raise ValueError(f"{name} debe ser <= {max_value}")
     return n
+
+
+def _str_arg(name: str, default: str = "") -> str:
+    return (request.args.get(name) or default).strip()
 
 
 def _get_settings_attr(name: str, default=None):
@@ -348,6 +365,7 @@ def _collect_urls_from_rich_text(rich_text_items: List[Dict[str, Any]]) -> List[
         link_url = link_obj.get("url")
         if isinstance(link_url, str) and link_url.startswith(("http://", "https://")):
             urls.append(link_url)
+
     return urls
 
 
@@ -396,7 +414,7 @@ def _extract_urls_from_blocks(blocks: List[Dict[str, Any]]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Relay URLs helpers (HTTP + rewrite de host para evitar self-call)
+# Relay URLs helpers (HTTP + rewrite de host + anti-caché interno)
 # ---------------------------------------------------------------------------
 
 def _normalize_host_for_compare(host: Optional[str]) -> str:
@@ -483,6 +501,30 @@ def _rewrite_url_for_relay(url: str) -> Tuple[str, Dict[str, Any]]:
     return rewritten, info
 
 
+def _append_query_param(url: str, key: str, value: str) -> str:
+    """
+    Añade un query param al final conservando el resto.
+    (No reemplaza si ya existe; intencionadamente "append" para no tocar semántica).
+    """
+    try:
+        sp = urlsplit(url)
+        q = parse_qsl(sp.query, keep_blank_values=True)
+        q.append((key, value))
+        new_query = urlencode(q, doseq=True)
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, new_query, sp.fragment))
+    except Exception:
+        return url
+
+
+def _relay_version_seed(urls_filtered: List[str]) -> str:
+    """
+    Versión estable derivada del contenido de URLs extraídas.
+    Cambia si cambia la página (al menos en cuanto a URLs).
+    """
+    joined = "\n".join(urls_filtered)
+    return hashlib.sha256(joined.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
 def _relay_get_url(url: str, *, timeout: int = 20, body_preview_bytes: int = 1200) -> Dict[str, Any]:
     """
     Relanza una URL con GET y devuelve resumen de respuesta.
@@ -495,6 +537,9 @@ def _relay_get_url(url: str, *, timeout: int = 20, body_preview_bytes: int = 120
             "User-Agent": "claude-bridge-notion-relay/1.0",
             "Accept": "*/*",
             "Accept-Encoding": "identity",  # simplifica preview
+            # anti-caché hacia el destino
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
         },
     )
 
@@ -585,6 +630,13 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     run = _bool_arg("run", True)
     include_blocks_debug = _bool_arg("include_blocks_debug", False)
     include_rewrite_debug = _bool_arg("include_rewrite_debug", False)
+    include_freshness_debug = _bool_arg("include_freshness_debug", True)
+
+    # Cache-busting interno (no depende del cliente)
+    relay_cache_bust = _bool_arg("relay_cache_bust", True)
+    relay_cache_bust_mode = _str_arg("relay_cache_bust_mode", "version").lower()
+    if relay_cache_bust_mode not in ("version", "timestamp"):
+        relay_cache_bust_mode = "version"
 
     page_id = (request.args.get("page_id") or "").strip()
     page_title = (request.args.get("page_title") or "").strip()
@@ -599,11 +651,14 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     url_prefix = (request.args.get("url_prefix") or "").strip() or None
     only_contains = (request.args.get("only_contains") or "").strip() or None
 
-    # Filtro práctico para evitar relanzar URLs externas si queréis:
+    # Filtro práctico para evitar relanzar URLs externas si queréis
     host_equals = (request.args.get("host_equals") or "").strip() or None
     only_current_host = _bool_arg("only_current_host", False)
     if only_current_host and not host_equals:
         host_equals = request.host  # ej. claude-bridge-i43j.onrender.com
+
+    served_at_ms = int(time.time() * 1000)
+    relay_request_id = f"nr-{served_at_ms}-{os.getpid()}"
 
     # 1) Resolver página
     notion_page_obj = None
@@ -644,7 +699,9 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     )
     urls_filtered = urls_filtered[:max_urls]
 
-    # 4) Relay (opcional) con rewrite de host
+    relay_version = _relay_version_seed(urls_filtered)
+
+    # 4) Relay (opcional) con rewrite de host + cache-busting interno
     relay_results: List[Dict[str, Any]] = []
     rewrite_applied = 0
     rewrite_debug: List[Dict[str, Any]] = []
@@ -655,7 +712,16 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             if rw.get("rewritten"):
                 rewrite_applied += 1
 
+            # Cache-busting interno automático (sin tocar la URL del cliente/Claude)
+            if relay_cache_bust:
+                if relay_cache_bust_mode == "timestamp":
+                    relay_url = _append_query_param(relay_url, "_relay_cb", str(served_at_ms))
+                else:
+                    # modo "version": cambia solo cuando cambian las URLs de Notion
+                    relay_url = _append_query_param(relay_url, "_relay_v", relay_version)
+
             res = _relay_get_url(relay_url, timeout=timeout, body_preview_bytes=body_preview_bytes)
+            # Transparencia/debug
             res["source_url"] = u
             res["relayed_url"] = relay_url
             res["host_rewrite"] = rw
@@ -693,6 +759,11 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             "request_host": rewrite_cfg["request_host"],
             "applied_count": rewrite_applied if run else 0,
         },
+        "freshness": {
+            "relay_cache_bust": relay_cache_bust,
+            "relay_cache_bust_mode": relay_cache_bust_mode,
+            "relay_version": relay_version,
+        },
         "urls": {
             "found_total": len(urls_all),
             "after_filters": len(urls_filtered),
@@ -714,7 +785,21 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     if include_rewrite_debug:
         resp["rewrite_debug"] = rewrite_debug
 
-    return jsonify(resp)
+    if include_freshness_debug:
+        resp["debug_freshness"] = {
+            "served_at_ms": served_at_ms,
+            "relay_request_id": relay_request_id,
+        }
+
+    response = jsonify(resp)
+    # Anti-caché en la respuesta del relay (importante para capas intermedias/cliente)
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    # Ayuda visual al debug
+    response.headers["X-Relay-Request-Id"] = relay_request_id
+    response.headers["X-Relay-Served-At-Ms"] = str(served_at_ms)
+    return response
 
 
 @bp.route("/relay_urls", methods=["GET", "OPTIONS"])
