@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 """
-Feature: notion_relay (v3)
+Feature: notion_relay (v4)
 Lee una página de Notion (por título o page_id), extrae URLs y las relanza por GET.
+
+NUEVO:
+- Si response_in_notion=true:
+  - escribe el resultado del relay en una página de Notion "respuesta"
+  - devuelve un mensaje fijo desde env RESPUESTA_LEER_NOTION
+  - pensado para esquivar caché agresiva por URL exacta del cliente
 
 Endpoints (GET):
 - /notion/relay_urls
@@ -12,26 +18,26 @@ Auth:
 - Usa el mismo @require_token del bridge (X-BRIDGE-TOKEN / token según vuestro core.auth)
 
 ENV esperadas:
-- NOTION_TOKEN                  (obligatoria)
-- NOTION_API_VERSION            (opcional, default: 2025-09-03)
-- NOTION_DEFAULT_PAGE_TITLE     (opcional, default: test_bridge)
+- NOTION_TOKEN                      (obligatoria)
+- NOTION_API_VERSION                (opcional, default: 2025-09-03)
+- NOTION_DEFAULT_PAGE_TITLE         (opcional, default: test_bridge)
 
 ENV opcionales para evitar self-call (rewrite de host):
-- RELAY_ORIGEN                  (ej: claude-bridge-i43j.onrender.com)
-- RELAY_DESTINO                 (ej: claude-bridge2.onrender.com)
+- RELAY_ORIGEN                      (ej: claude-bridge-i43j.onrender.com)
+- RELAY_DESTINO                     (ej: claude-bridge2.onrender.com)
 
-Notas de caché:
-- El cliente (Claude) puede repetir siempre la misma URL del relay.
-- Para evitar resultados viejos:
-  1) el relay añade headers anti-caché en SU respuesta
-  2) el relay añade internamente _relay_v / _relay_cb a las URLs que relanza
-     (sin que el cliente tenga que cambiar nada)
+ENV opcionales para respuesta en Notion:
+- NOTION_RESPONSE_PAGE_TITLE        (opcional, default: test_bridge_respuesta)
+- RESPUESTA_LEER_NOTION             (opcional, texto que se devuelve a Claude)
 
-Ejemplos:
-- /notion/relay_test_bridge?run=0
-- /notion/relay_test_bridge?run=1&token=...
-- /notion/relay_test_bridge?only_current_host=1&only_contains=/api/message&run=1&token=...
-- /notion/relay_test_bridge?run=1&include_rewrite_debug=1&include_freshness_debug=1
+Params útiles:
+- run=1|0
+- response_in_notion=1|0
+- response_page_title=...
+- response_page_id=...
+- response_mode=replace|append
+- response_include_full_json=1|0
+- response_max_json_chars=...
 """
 
 import hashlib
@@ -73,6 +79,12 @@ RICH_TEXT_BLOCK_TYPES = {
     "synced_block",
     "table_of_contents",
 }
+
+# Límites prácticos para Notion
+NOTION_MAX_CHILDREN_PER_APPEND = 100
+NOTION_TEXT_CHUNK = 1800  # conservador (rich_text text content suele tener límite por segmento)
+DEFAULT_RESPONSE_JSON_MAX_CHARS = 20000
+MAX_RESPONSE_JSON_MAX_CHARS = 200000
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +152,27 @@ def _dedupe_keep_order(items: Iterable[str]) -> List[str]:
     return out
 
 
+def _truncate_text(s: str, n: int) -> str:
+    if n <= 0:
+        return ""
+    if len(s) <= n:
+        return s
+    return s[: max(0, n - 1)] + "…"
+
+
+def _chunks(s: str, size: int) -> List[str]:
+    if size <= 0:
+        return [s]
+    if not s:
+        return [""]
+    return [s[i:i + size] for i in range(0, len(s), size)]
+
+
 # ---------------------------------------------------------------------------
 # Notion API helpers
 # ---------------------------------------------------------------------------
 
 def _notion_token() -> str:
-    # Preferimos SETTINGS si existe, pero también permitimos env directo
     return (
         _get_settings_attr("NOTION_TOKEN", None)
         or os.environ.get("NOTION_TOKEN", "")
@@ -210,7 +237,6 @@ def _http_json(
 def _notion_search_pages(query: str, *, timeout: int = 20, page_size: int = 25, max_pages: int = 5) -> List[Dict[str, Any]]:
     """
     Busca páginas en Notion (solo pages) usando /v1/search.
-    Filtramos por object=page en cliente para reducir dependencia de cambios de schema del filter.
     """
     results: List[Dict[str, Any]] = []
     next_cursor = None
@@ -250,7 +276,6 @@ def _notion_search_pages(query: str, *, timeout: int = 20, page_size: int = 25, 
 
 
 def _extract_page_title(page_obj: Dict[str, Any]) -> str:
-    # Search devuelve page object con properties; buscamos la property tipo title
     props = page_obj.get("properties") or {}
     for _prop_name, prop in props.items():
         if isinstance(prop, dict) and prop.get("type") == "title":
@@ -258,7 +283,6 @@ def _extract_page_title(page_obj: Dict[str, Any]) -> str:
             txt = "".join((p.get("plain_text") or "") for p in parts if isinstance(p, dict))
             if txt.strip():
                 return txt.strip()
-    # Fallbacks
     if page_obj.get("title"):
         t = page_obj.get("title")
         if isinstance(t, list):
@@ -276,12 +300,12 @@ def _find_page_by_title(title: str, *, timeout: int = 20) -> Optional[Dict[str, 
     if not pages:
         return None
 
-    # 1) exact match por título
+    # 1) exact match
     for p in pages:
         if _extract_page_title(p).strip().lower() == title_norm:
             return p
 
-    # 2) fallback: primero que contenga
+    # 2) contains
     for p in pages:
         t = _extract_page_title(p).strip().lower()
         if title_norm in t:
@@ -318,6 +342,55 @@ def _notion_get_block_children(block_id: str, *, timeout: int = 20, page_size: i
     return out
 
 
+def _notion_append_block_children(block_id: str, children: List[Dict[str, Any]], *, timeout: int = 20) -> Dict[str, Any]:
+    status, payload = _http_json(
+        "PATCH",
+        f"{NOTION_API_BASE}/blocks/{block_id}/children",
+        headers=_notion_headers(json_body=True),
+        body={"children": children},
+        timeout=timeout,
+    )
+    if status != 200:
+        raise RuntimeError(f"Notion append children error ({status}): {payload}")
+    return payload
+
+
+def _notion_delete_block(block_id: str, *, timeout: int = 20) -> Dict[str, Any]:
+    status, payload = _http_json(
+        "DELETE",
+        f"{NOTION_API_BASE}/blocks/{block_id}",
+        headers=_notion_headers(json_body=False),
+        timeout=timeout,
+    )
+    if status != 200:
+        raise RuntimeError(f"Notion delete block error ({status}): {payload}")
+    return payload
+
+
+def _notion_clear_page_top_level_children(page_id: str, *, timeout: int = 20, max_delete: int = 500) -> Dict[str, Any]:
+    children = _notion_get_block_children(page_id, timeout=timeout)
+    deleted = 0
+    errors: List[str] = []
+
+    for b in children[:max_delete]:
+        bid = b.get("id")
+        if not bid:
+            continue
+        try:
+            _notion_delete_block(bid, timeout=timeout)
+            deleted += 1
+        except Exception as e:
+            errors.append(str(e))
+
+    return {
+        "found": len(children),
+        "deleted": deleted,
+        "errors_count": len(errors),
+        "errors": errors[:10],
+        "truncated_by_max_delete": len(children) > max_delete,
+    }
+
+
 def _walk_blocks_recursive(root_block_id: str, *, timeout: int = 20, max_blocks: int = 2000) -> List[Dict[str, Any]]:
     """
     DFS simple. Guardamos todos los bloques (incluidos anidados) hasta max_blocks.
@@ -340,6 +413,197 @@ def _walk_blocks_recursive(root_block_id: str, *, timeout: int = 20, max_blocks:
 
 
 # ---------------------------------------------------------------------------
+# Builders de bloques Notion (para escribir respuestas)
+# ---------------------------------------------------------------------------
+
+def _rt(text: str) -> List[Dict[str, Any]]:
+    # Un único segmento de rich_text
+    return [{"type": "text", "text": {"content": text}}]
+
+
+def _block_paragraph(text: str) -> Dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": _rt(text)},
+    }
+
+
+def _block_heading_2(text: str) -> Dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {"rich_text": _rt(text)},
+    }
+
+
+def _block_heading_3(text: str) -> Dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "heading_3",
+        "heading_3": {"rich_text": _rt(text)},
+    }
+
+
+def _block_bullet(text: str) -> Dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": _rt(text)},
+    }
+
+
+def _block_code(text: str, language: str = "plain text") -> Dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "code",
+        "code": {"rich_text": _rt(text), "language": language},
+    }
+
+
+def _text_to_paragraph_blocks(text: str, *, max_chunk: int = NOTION_TEXT_CHUNK) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for part in _chunks(text, max_chunk):
+        out.append(_block_paragraph(part if part else ""))
+    return out
+
+
+def _text_to_code_blocks(text: str, *, max_chunk: int = NOTION_TEXT_CHUNK, language: str = "plain text") -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for part in _chunks(text, max_chunk):
+        out.append(_block_code(part if part else "", language=language))
+    return out
+
+
+def _append_blocks_batched(parent_id: str, blocks: List[Dict[str, Any]], *, timeout: int = 20) -> Dict[str, Any]:
+    batches = 0
+    created_total = 0
+
+    for i in range(0, len(blocks), NOTION_MAX_CHILDREN_PER_APPEND):
+        chunk = blocks[i:i + NOTION_MAX_CHILDREN_PER_APPEND]
+        payload = _notion_append_block_children(parent_id, chunk, timeout=timeout)
+        created_total += len(payload.get("results", []) or [])
+        batches += 1
+
+    return {
+        "batches": batches,
+        "blocks_requested": len(blocks),
+        "blocks_created_returned": created_total,
+    }
+
+
+def _compose_notion_report_blocks(
+    *,
+    source_page_info: Dict[str, Any],
+    relay_results: List[Dict[str, Any]],
+    response_notice: str,
+    served_at_ms: int,
+    relay_request_id: str,
+    relay_version: str,
+    rewrite_info: Dict[str, Any],
+    response_in_notion_params: Dict[str, Any],
+    include_full_json: bool,
+    response_json_max_chars: int,
+) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+
+    ts_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(served_at_ms / 1000))
+
+    blocks.append(_block_heading_2("Claude Bridge Relay Response"))
+    blocks.append(_block_paragraph(f"request_id={relay_request_id}"))
+    blocks.append(_block_paragraph(f"served_at_ms={served_at_ms} ({ts_iso})"))
+    blocks.append(_block_paragraph(f"relay_version={relay_version}"))
+
+    src_title = source_page_info.get("title") or ""
+    src_id = source_page_info.get("page_id") or ""
+    src_mode = source_page_info.get("mode") or ""
+    blocks.append(_block_heading_3("Fuente"))
+    blocks.append(_block_bullet(f"mode={src_mode}"))
+    if src_title:
+        blocks.append(_block_bullet(f"title={src_title}"))
+    if src_id:
+        blocks.append(_block_bullet(f"page_id={src_id}"))
+
+    blocks.append(_block_heading_3("Relay"))
+    blocks.append(_block_bullet(f"rewrite_enabled={rewrite_info.get('enabled')}"))
+    blocks.append(_block_bullet(f"origin_host={rewrite_info.get('origin_host') or ''}"))
+    blocks.append(_block_bullet(f"dest_host={rewrite_info.get('dest_host') or ''}"))
+    blocks.append(_block_bullet(f"applied_count={rewrite_info.get('applied_count', 0)}"))
+    blocks.append(_block_bullet(f"results={len(relay_results)}"))
+
+    if response_notice:
+        blocks.append(_block_heading_3("Mensaje para Claude"))
+        for b in _text_to_paragraph_blocks(response_notice, max_chunk=NOTION_TEXT_CHUNK):
+            blocks.append(b)
+
+    blocks.append(_block_heading_3("Resumen de resultados"))
+    if not relay_results:
+        blocks.append(_block_bullet("Sin resultados"))
+    else:
+        for idx, r in enumerate(relay_results, start=1):
+            status = r.get("status")
+            ok = r.get("ok")
+            elapsed = r.get("elapsed_ms")
+            src = _truncate_text(r.get("source_url", ""), 180)
+            relayed = _truncate_text(r.get("relayed_url", ""), 180)
+            err = _truncate_text(r.get("error", ""), 180) if r.get("error") else ""
+            blocks.append(_block_bullet(f"#{idx} ok={ok} status={status} elapsed_ms={elapsed}"))
+            blocks.append(_block_bullet(f"#{idx} source_url={src}"))
+            blocks.append(_block_bullet(f"#{idx} relayed_url={relayed}"))
+            if err:
+                blocks.append(_block_bullet(f"#{idx} error={err}"))
+
+    # JSON completo/sanitizado opcional
+    if include_full_json:
+        blocks.append(_block_heading_3("JSON Relay (sanitizado)"))
+        payload_for_json = {
+            "relay_request_id": relay_request_id,
+            "served_at_ms": served_at_ms,
+            "relay_version": relay_version,
+            "source_page_info": source_page_info,
+            "rewrite": rewrite_info,
+            "response_in_notion": response_in_notion_params,
+            "relay_results": relay_results,
+        }
+        js = json.dumps(payload_for_json, ensure_ascii=False, indent=2)
+        js = _truncate_text(js, response_json_max_chars)
+        blocks.extend(_text_to_code_blocks(js, max_chunk=NOTION_TEXT_CHUNK, language="json"))
+
+    return blocks
+
+
+def _resolve_response_page(
+    *,
+    response_page_id: str,
+    response_page_title: str,
+    timeout: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Devuelve (page_info, error_msg)
+    page_info: {"page_id","title","mode"}
+    """
+    if response_page_id:
+        return {
+            "page_id": response_page_id,
+            "title": "",
+            "mode": "page_id",
+        }, None
+
+    if not response_page_title:
+        return None, "Falta response_page_title y response_page_id"
+
+    p = _find_page_by_title(response_page_title, timeout=timeout)
+    if not p:
+        return None, f"Página de respuesta no encontrada: {response_page_title}"
+
+    return {
+        "page_id": p.get("id"),
+        "title": _extract_page_title(p) or response_page_title,
+        "mode": "search_title",
+    }, None
+
+
+# ---------------------------------------------------------------------------
 # Extracción de URLs desde bloques de Notion
 # ---------------------------------------------------------------------------
 
@@ -349,17 +613,14 @@ def _collect_urls_from_rich_text(rich_text_items: List[Dict[str, Any]]) -> List[
         if not isinstance(rt, dict):
             continue
 
-        # href explícito (ej. texto enlazado)
         href = rt.get("href")
         if isinstance(href, str) and href.startswith(("http://", "https://")):
             urls.append(href)
 
-        # plain_text con URL escrita
         plain = rt.get("plain_text") or ""
         if plain:
             urls.extend(URL_RE.findall(plain))
 
-        # text.link.url (cuando el rich_text es de tipo text con enlace)
         text_obj = rt.get("text") or {}
         link_obj = text_obj.get("link") or {}
         link_url = link_obj.get("url")
@@ -378,16 +639,13 @@ def _extract_urls_from_block(block: Dict[str, Any]) -> List[str]:
 
     data = block.get(btype) or {}
 
-    # Bloques con rich_text
     if btype in RICH_TEXT_BLOCK_TYPES:
         urls.extend(_collect_urls_from_rich_text(data.get("rich_text") or []))
 
-    # Bloques con campo URL directo
     v = data.get("url")
     if isinstance(v, str) and v.startswith(("http://", "https://")):
         urls.append(v)
 
-    # Archivos externos (image/file/pdf/video/audio)
     if btype in ("image", "file", "pdf", "video", "audio"):
         file_obj = data.get("external") or {}
         ext_url = file_obj.get("url")
@@ -454,11 +712,6 @@ def _relay_rewrite_config() -> Dict[str, Any]:
 
 
 def _rewrite_url_for_relay(url: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    Reescribe SOLO el host (netloc) si coincide con RELAY_ORIGEN.
-    Además, para evitar rebotes/loops, solo reescribe cuando la request actual
-    entra por el bridge de origen.
-    """
     cfg = _relay_rewrite_config()
     info = {
         "rewritten": False,
@@ -471,7 +724,7 @@ def _rewrite_url_for_relay(url: str) -> Tuple[str, Dict[str, Any]]:
         info["reason"] = "disabled_or_invalid_env"
         return url, info
 
-    # Evita que el bridge destino vuelva a reescribir si alguien llama allí por error
+    # Evita rebotes: solo reescribir si la request entró por el host origen
     if cfg["request_host"] != cfg["origin_host"]:
         info["reason"] = "request_not_on_origin_host"
         return url, info
@@ -502,10 +755,6 @@ def _rewrite_url_for_relay(url: str) -> Tuple[str, Dict[str, Any]]:
 
 
 def _append_query_param(url: str, key: str, value: str) -> str:
-    """
-    Añade un query param al final conservando el resto.
-    (No reemplaza si ya existe; intencionadamente "append" para no tocar semántica).
-    """
     try:
         sp = urlsplit(url)
         q = parse_qsl(sp.query, keep_blank_values=True)
@@ -517,18 +766,11 @@ def _append_query_param(url: str, key: str, value: str) -> str:
 
 
 def _relay_version_seed(urls_filtered: List[str]) -> str:
-    """
-    Versión estable derivada del contenido de URLs extraídas.
-    Cambia si cambia la página (al menos en cuanto a URLs).
-    """
     joined = "\n".join(urls_filtered)
     return hashlib.sha256(joined.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def _relay_get_url(url: str, *, timeout: int = 20, body_preview_bytes: int = 1200) -> Dict[str, Any]:
-    """
-    Relanza una URL con GET y devuelve resumen de respuesta.
-    """
     started = time.time()
     req = Request(
         url=url,
@@ -536,8 +778,7 @@ def _relay_get_url(url: str, *, timeout: int = 20, body_preview_bytes: int = 120
         headers={
             "User-Agent": "claude-bridge-notion-relay/1.0",
             "Accept": "*/*",
-            "Accept-Encoding": "identity",  # simplifica preview
-            # anti-caché hacia el destino
+            "Accept-Encoding": "identity",
             "Cache-Control": "no-cache, no-store, max-age=0",
             "Pragma": "no-cache",
         },
@@ -605,6 +846,31 @@ def _filter_urls(
 
 
 # ---------------------------------------------------------------------------
+# Sanitizado relay para guardar/devolver
+# ---------------------------------------------------------------------------
+
+def _sanitize_relay_result_for_storage(r: Dict[str, Any], *, max_preview_chars: int = 4000) -> Dict[str, Any]:
+    out = {
+        "ok": r.get("ok"),
+        "status": r.get("status"),
+        "elapsed_ms": r.get("elapsed_ms"),
+        "content_type": r.get("content_type"),
+        "content_length": r.get("content_length"),
+        "error": r.get("error"),
+        "source_url": r.get("source_url") or r.get("url"),
+        "relayed_url": r.get("relayed_url") or r.get("final_url") or r.get("url"),
+        "host_rewrite": r.get("host_rewrite"),
+    }
+    if "body_preview" in r:
+        out["body_preview"] = _truncate_text(r.get("body_preview") or "", max_preview_chars)
+    return out
+
+
+def _sanitize_relay_results_for_storage(results: List[Dict[str, Any]], *, max_preview_chars: int = 4000) -> List[Dict[str, Any]]:
+    return [_sanitize_relay_result_for_storage(r, max_preview_chars=max_preview_chars) for r in results]
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -624,6 +890,12 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
         max_urls = _int_arg("max_urls", 20, min_value=1, max_value=200)
         max_blocks = _int_arg("max_blocks", 2000, min_value=1, max_value=20000)
         body_preview_bytes = _int_arg("body_preview_bytes", 1200, min_value=100, max_value=20000)
+        response_json_max_chars = _int_arg(
+            "response_max_json_chars",
+            DEFAULT_RESPONSE_JSON_MAX_CHARS,
+            min_value=1000,
+            max_value=MAX_RESPONSE_JSON_MAX_CHARS,
+        )
     except ValueError as e:
         return _json_error(str(e), 400)
 
@@ -638,8 +910,30 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     if relay_cache_bust_mode not in ("version", "timestamp"):
         relay_cache_bust_mode = "version"
 
-    page_id = (request.args.get("page_id") or "").strip()
-    page_title = (request.args.get("page_title") or "").strip()
+    # Nuevo: guardar respuesta en Notion para esquivar caché cliente
+    response_in_notion = _bool_arg("response_in_notion", False)
+    response_mode = _str_arg("response_mode", "replace").lower()
+    if response_mode not in ("replace", "append"):
+        response_mode = "replace"
+
+    response_page_id = _str_arg("response_page_id", "")
+    response_page_title = _str_arg(
+        "response_page_title",
+        _get_settings_attr("NOTION_RESPONSE_PAGE_TITLE", None)
+        or os.environ.get("NOTION_RESPONSE_PAGE_TITLE")
+        or "test_bridge_respuesta",
+    )
+
+    response_include_full_json = _bool_arg("response_include_full_json", True)
+
+    response_notice = (
+        _get_settings_attr("RESPUESTA_LEER_NOTION", None)
+        or os.environ.get("RESPUESTA_LEER_NOTION", "")
+        or "Claude, la respuesta debes leerla en Notion porque aquí puede estar cacheada."
+    )
+
+    page_id = _str_arg("page_id", "")
+    page_title = _str_arg("page_title", "")
 
     if not page_id:
         page_title = page_title or default_page_title or (
@@ -648,25 +942,23 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             or "test_bridge"
         )
 
-    url_prefix = (request.args.get("url_prefix") or "").strip() or None
-    only_contains = (request.args.get("only_contains") or "").strip() or None
+    url_prefix = _str_arg("url_prefix", "") or None
+    only_contains = _str_arg("only_contains", "") or None
 
-    # Filtro práctico para evitar relanzar URLs externas si queréis
-    host_equals = (request.args.get("host_equals") or "").strip() or None
+    host_equals = _str_arg("host_equals", "") or None
     only_current_host = _bool_arg("only_current_host", False)
     if only_current_host and not host_equals:
-        host_equals = request.host  # ej. claude-bridge-i43j.onrender.com
+        host_equals = request.host
 
     served_at_ms = int(time.time() * 1000)
     relay_request_id = f"nr-{served_at_ms}-{os.getpid()}"
 
-    # 1) Resolver página
+    # 1) Resolver página origen
     notion_page_obj = None
     page_lookup = {"mode": None, "page_id": None, "page_title": None}
 
     try:
         if page_id:
-            # No hace falta retrieve page para leer contenido; page_id sirve como block_id.
             page_lookup["mode"] = "page_id"
             page_lookup["page_id"] = page_id
         else:
@@ -712,16 +1004,13 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             if rw.get("rewritten"):
                 rewrite_applied += 1
 
-            # Cache-busting interno automático (sin tocar la URL del cliente/Claude)
             if relay_cache_bust:
                 if relay_cache_bust_mode == "timestamp":
                     relay_url = _append_query_param(relay_url, "_relay_cb", str(served_at_ms))
                 else:
-                    # modo "version": cambia solo cuando cambian las URLs de Notion
                     relay_url = _append_query_param(relay_url, "_relay_v", relay_version)
 
             res = _relay_get_url(relay_url, timeout=timeout, body_preview_bytes=body_preview_bytes)
-            # Transparencia/debug
             res["source_url"] = u
             res["relayed_url"] = relay_url
             res["host_rewrite"] = rw
@@ -735,6 +1024,96 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             })
 
     rewrite_cfg = _relay_rewrite_config()
+    rewrite_info = {
+        "enabled": rewrite_cfg["enabled"],
+        "origin_host": rewrite_cfg["origin_host"],
+        "dest_host": rewrite_cfg["dest_host"],
+        "request_host": rewrite_cfg["request_host"],
+        "applied_count": rewrite_applied if run else 0,
+    }
+
+    # 5) Opcional: escribir respuesta en Notion
+    notion_response_write: Dict[str, Any] = {
+        "enabled": response_in_notion,
+        "ok": None,
+        "page": None,
+        "mode": response_mode,
+        "cleared": None,
+        "append": None,
+        "error": None,
+    }
+
+    relay_results_sanitized = _sanitize_relay_results_for_storage(relay_results, max_preview_chars=4000)
+
+    if response_in_notion and run:
+        try:
+            page_info, page_err = _resolve_response_page(
+                response_page_id=response_page_id,
+                response_page_title=response_page_title,
+                timeout=timeout,
+            )
+            if page_err or not page_info:
+                raise RuntimeError(page_err or "No se pudo resolver página de respuesta")
+
+            source_page_info = {
+                "mode": page_lookup.get("mode"),
+                "page_id": page_lookup.get("page_id"),
+                "title": page_lookup.get("page_title") or page_title or "",
+            }
+
+            blocks_to_write = _compose_notion_report_blocks(
+                source_page_info=source_page_info,
+                relay_results=relay_results_sanitized,
+                response_notice=response_notice,
+                served_at_ms=served_at_ms,
+                relay_request_id=relay_request_id,
+                relay_version=relay_version,
+                rewrite_info=rewrite_info,
+                response_in_notion_params={
+                    "enabled": True,
+                    "response_mode": response_mode,
+                    "response_include_full_json": response_include_full_json,
+                },
+                include_full_json=response_include_full_json,
+                response_json_max_chars=response_json_max_chars,
+            )
+
+            cleared = None
+            if response_mode == "replace":
+                cleared = _notion_clear_page_top_level_children(page_info["page_id"], timeout=timeout)
+
+            appended = _append_blocks_batched(page_info["page_id"], blocks_to_write, timeout=timeout)
+
+            notion_response_write.update({
+                "ok": True,
+                "page": page_info,
+                "cleared": cleared,
+                "append": appended,
+            })
+        except Exception as e:
+            notion_response_write.update({
+                "ok": False,
+                "error": str(e),
+            })
+
+    # 6) Respuesta final
+    # Si response_in_notion=true, devolvemos el mensaje fijo para Claude y resumimos la carga,
+    # para no depender de leer aquí el body (que puede venir cacheado en cliente).
+    relay_public_results: List[Dict[str, Any]]
+    if response_in_notion:
+        relay_public_results = [
+            {
+                "ok": r.get("ok"),
+                "status": r.get("status"),
+                "elapsed_ms": r.get("elapsed_ms"),
+                "source_url": r.get("source_url"),
+                "relayed_url": r.get("relayed_url"),
+                "error": r.get("error"),
+            }
+            for r in relay_results
+        ]
+    else:
+        relay_public_results = relay_results
 
     resp: Dict[str, Any] = {
         "ok": True,
@@ -752,13 +1131,7 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
             "only_current_host": only_current_host,
             "max_urls": max_urls,
         },
-        "rewrite": {
-            "enabled": rewrite_cfg["enabled"],
-            "origin_host": rewrite_cfg["origin_host"],
-            "dest_host": rewrite_cfg["dest_host"],
-            "request_host": rewrite_cfg["request_host"],
-            "applied_count": rewrite_applied if run else 0,
-        },
+        "rewrite": rewrite_info,
         "freshness": {
             "relay_cache_bust": relay_cache_bust,
             "relay_cache_bust_mode": relay_cache_bust_mode,
@@ -771,10 +1144,19 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
         },
         "relay": {
             "run": run,
-            "count": len(relay_results),
-            "results": relay_results,
+            "count": len(relay_public_results),
+            "results": relay_public_results,
+        },
+        "response_in_notion": {
+            "enabled": response_in_notion,
+            "notice": response_notice if response_in_notion else None,
+            "write": notion_response_write,
         },
     }
+
+    # Mensaje top-level para que Claude lo tenga muy a mano
+    if response_in_notion:
+        resp["message"] = response_notice
 
     if include_blocks_debug:
         resp["blocks_debug"] = [
@@ -796,7 +1178,6 @@ def _relay_urls_impl(default_page_title: Optional[str] = None):
     response.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
-    # Ayuda visual al debug
     response.headers["X-Relay-Request-Id"] = relay_request_id
     response.headers["X-Relay-Served-At-Ms"] = str(served_at_ms)
     return response
