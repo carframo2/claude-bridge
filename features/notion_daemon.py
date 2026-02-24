@@ -37,7 +37,7 @@ from flask import Blueprint, jsonify
 log = logging.getLogger("notion_daemon")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BRIDGE_URL      = os.environ.get("DAEMON_BRIDGE_URL", "http://localhost:5000")
+BRIDGE_URL      = os.environ.get("DAEMON_BRIDGE_URL", "https://claude-bridge-i43j.onrender.com")
 TOKEN           = os.environ.get("DAEMON_TOKEN", "kienzan")
 POLL_INTERVAL   = int(os.environ.get("DAEMON_POLL_INTERVAL", "10"))
 PING_INTERVAL   = int(os.environ.get("DAEMON_PING_INTERVAL", "25"))
