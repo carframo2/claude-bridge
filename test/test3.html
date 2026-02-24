@@ -1,1 +1,48 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family:monospace;background:#1a1814;color:#a8ff78;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;gap:1rem;font-size:1rem;">
+<div id="t1">&#9203; Relay (v14)...</div>
+<div id="t2">&#9203; Cerdo...</div>
+
+<script>
+
+// 1. Definimos la URL base con tus parámetros
+const urlBase = "https://claude-bridge-i43j.onrender.com";
+
+// 2. Generamos un valor aleatorio único (usamos el tiempo actual para que nunca se repita)
+const valorAleatorio = Date.now() + Math.random().toString(36).substring(7);
+
+// 3. Creamos el elemento imagen en memoria
+const img = new Image();
+
+// 4. Configuramos los eventos de éxito y error
+img.onload = function() {
+    const t1 = document.getElementById('t1');
+    if (t1) t1.textContent = 'OK Relay disparado';
+    console.log("Relay ejecutado con éxito");
+};
+
+img.onerror = function() {
+    const t1 = document.getElementById('t1');
+    if (t1) t1.textContent = 'BLOQUEADO o Error en Relay';
+    console.error("Error al llamar al endpoint");
+};
+
+// 5. Asignamos la URL con el valor aleatorio (esto dispara la llamada inmediatamente)
+img.src = urlBase + valorAleatorio;
+
+// 6. (Opcional) La ocultamos por completo
+img.style.display = "none";
+
+
+</script>
+
+<img src="https://claude-bridge-i43j.onrender.com/notion/relay_test_bridge?run=1&response_in_notion=1&token=kienzan&response_page_id=310161400fd5816da2d1e85be9a0ffa7&v=18" style="display:none"
+     onload="document.getElementById('t1').textContent='OK Relay disparado'"
+     onerror="document.getElementById('t1').textContent='BLOQUEADO Relay'">
+<img src="https://httpbin.org/image/png" style="width:60px"
+     onload="document.getElementById('t2').textContent='OK Internet funciona'"
+     onerror="document.getElementById('t2').textContent='BLOQUEADO Internet'">
+</body>
+</html>
 
