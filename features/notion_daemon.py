@@ -13,19 +13,19 @@ Funciones del daemon:
   2. Notion polling: llama al relay en el bridge SECUNDARIO cada
      DAEMON_POLL_INTERVAL segundos. Si test_bridge tiene URL nueva,
      el relay la ejecuta y guarda respuesta en test_bridge_response.
-     Si no hay novedad, el relay retorna rápido (keep-alive ligero).
+     Si no hay novedad, el relay retorna rapido (keep-alive ligero).
 
 Variables de entorno:
   IS_PRIMARY            "true" solo en el bridge principal
   DAEMON_SECONDARY_URL  URL del bridge secundario
                         (default: https://claude-bridge2.onrender.com)
-  DAEMON_TOKEN          Token de autenticación (default: kienzan)
+  DAEMON_TOKEN          Token de autenticacion (default: kienzan)
   DAEMON_POLL_INTERVAL  Segundos entre polls (default: 10)
   DAEMON_PING_INTERVAL  Segundos entre pings keep-alive (default: 25)
   DAEMON_RESPONSE_PAGE  Page ID de test_bridge_response en Notion
                         (default: 310161400fd5816da2d1e85be9a0ffa7)
 
-Instalación: solo copiar este fichero en features/. No tocar nada más.
+Instalacion: solo copiar este fichero en features/. No tocar nada mas.
 """
 
 import os
@@ -38,17 +38,17 @@ from flask import Blueprint, jsonify
 
 log = logging.getLogger("notion_daemon")
 
-# ── ¿Soy el bridge primario? ──────────────────────────────────────────────────
-_is_primary_env  = os.environ.get("IS_PRIMARY", "").lower() == "true"
-_render_url      = os.environ.get("RENDER_EXTERNAL_URL", "")
-IS_PRIMARY       = _is_primary_env or "claude-bridge-i43j" in _render_url
+# -- Soy el bridge primario? --------------------------------------------------
+_is_primary_env = os.environ.get("IS_PRIMARY", "").lower() == "true"
+_render_url     = os.environ.get("RENDER_EXTERNAL_URL", "")
+IS_PRIMARY      = _is_primary_env or "claude-bridge-i43j" in _render_url
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SECONDARY_URL   = os.environ.get("DAEMON_SECONDARY_URL", "https://claude-bridge2.onrender.com")
-TOKEN           = os.environ.get("DAEMON_TOKEN", "kienzan")
-POLL_INTERVAL   = int(os.environ.get("DAEMON_POLL_INTERVAL", "10"))
-PING_INTERVAL   = int(os.environ.get("DAEMON_PING_INTERVAL", "25"))
-RESPONSE_PAGE   = os.environ.get("DAEMON_RESPONSE_PAGE", "310161400fd5816da2d1e85be9a0ffa7")
+# -- Config -------------------------------------------------------------------
+SECONDARY_URL = os.environ.get("DAEMON_SECONDARY_URL", "https://claude-bridge2.onrender.com")
+TOKEN         = os.environ.get("DAEMON_TOKEN", "kienzan")
+POLL_INTERVAL = int(os.environ.get("DAEMON_POLL_INTERVAL", "10"))
+PING_INTERVAL = int(os.environ.get("DAEMON_PING_INTERVAL", "25"))
+RESPONSE_PAGE = os.environ.get("DAEMON_RESPONSE_PAGE", "310161400fd5816da2d1e85be9a0ffa7")
 
 RELAY_URL = (
     f"{SECONDARY_URL}/notion/relay_test_bridge"
@@ -60,8 +60,10 @@ RELAY_URL = (
 
 HEALTH_URL = f"{SECONDARY_URL}/health"
 
-# ── Blueprint ─────────────────────────────────────────────────────────────────
+# -- Blueprint ----------------------------------------------------------------
 bp = Blueprint("notion_daemon", __name__, url_prefix="/daemon")
+
+_stats = {"polls": 0, "pings": 0, "errors": 0, "last_error": None}
 
 
 @bp.route("/status", methods=["GET"])
@@ -81,18 +83,13 @@ def status():
     })
 
 
-# ── Estado interno ─────────────────────────────────────────────────────────────
-_stats = {"polls": 0, "pings": 0, "errors": 0, "last_error": None}
-
-
-# ── Funciones del daemon ───────────────────────────────────────────────────────
+# -- Daemon -------------------------------------------------------------------
 def _poll_notion():
-    """Llama al relay en el secundario. Keep-alive + ejecución si hay URL nueva."""
     try:
         url = f"{RELAY_URL}&_dc={int(time.time())}"
         r = requests.get(url, timeout=30)
         _stats["polls"] += 1
-        log.debug(f"[daemon] poll #{_stats['polls']} → {r.status_code}")
+        log.debug(f"[daemon] poll #{_stats['polls']} -> {r.status_code}")
         _stats["last_error"] = None
     except Exception as e:
         _stats["errors"] += 1
@@ -101,11 +98,10 @@ def _poll_notion():
 
 
 def _ping():
-    """Ping keep-alive al bridge secundario."""
     try:
         r = requests.get(HEALTH_URL, timeout=10)
         _stats["pings"] += 1
-        log.debug(f"[daemon] ping #{_stats['pings']} → {r.status_code}")
+        log.debug(f"[daemon] ping #{_stats['pings']} -> {r.status_code}")
     except Exception as e:
         _stats["errors"] += 1
         _stats["last_error"] = str(e)
@@ -113,7 +109,7 @@ def _ping():
 
 
 def _daemon_loop():
-    log.info(f"[daemon] arrancado — poll cada {POLL_INTERVAL}s, ping cada {PING_INTERVAL}s → {SECONDARY_URL}")
+    log.info(f"[daemon] arrancado — poll cada {POLL_INTERVAL}s, ping cada {PING_INTERVAL}s -> {SECONDARY_URL}")
     last_ping = 0
     last_poll = 0
 
@@ -137,8 +133,8 @@ def _start_daemon():
     log.info("[daemon] thread iniciado")
 
 
-# ── Arranque automático ────────────────────────────────────────────────────────
+# -- Arranque automatico al importar ------------------------------------------
 if IS_PRIMARY:
-    #_start_daemon()
+    _start_daemon()
 else:
     log.info("[daemon] bridge secundario — daemon no arranca")
