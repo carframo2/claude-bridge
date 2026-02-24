@@ -135,6 +135,6 @@ def _start_daemon():
 
 # -- Arranque automatico al importar ------------------------------------------
 if IS_PRIMARY:
-    _start_daemon()
+   # _start_daemon()
 else:
     log.info("[daemon] bridge secundario — daemon no arranca")
