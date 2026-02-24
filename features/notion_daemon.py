@@ -135,4 +135,4 @@ def _start_daemon():
 
 
 # ── Arranque automático al importar ──────────────────────────────────────────
-_start_daemon()
+#_start_daemon()
