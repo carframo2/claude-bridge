@@ -159,29 +159,31 @@ def _provided_pass() -> str:
         or ""
     )
 
-
 def _auth_identity():
     """
     Devuelve identidad autenticada:
-      {"mode":"bridge"}  -> admin/master token
+      {"mode":"bridge"}  -> admin/master token (solo si NO viene user/pass)
       {"mode":"user", "user":"carlos"}
+    Regla importante:
+    - Si viene user/pass (aunque también venga BRIDGE_TOKEN), se evalúa user/pass y se aplica ACL.
     """
-    # 1) Master token (admin)
-    if _is_master_bridge_auth():
-        return {"mode": "bridge", "user": None}
-
-    # 2) User/pass
     username = _provided_user()
     password = _provided_pass()
 
-    if not username or not password:
-        return None
+    # Si el cliente intenta auth de usuario, NO hacer bypass por BRIDGE_TOKEN.
+    if username or password:
+        if not username or not password:
+            return {"mode": "invalid", "reason": "Falta user o pass"}
+        ok, reason = verify_user_password(username, password)
+        if not ok:
+            return {"mode": "invalid", "reason": reason}
+        return {"mode": "user", "user": username}
 
-    ok, reason = verify_user_password(username, password)
-    if not ok:
-        return {"mode": "invalid", "reason": reason}
+    # Solo si NO hay user/pass, permitir modo admin por BRIDGE_TOKEN
+    if _is_master_bridge_auth():
+        return {"mode": "bridge", "user": None}
 
-    return {"mode": "user", "user": username}
+    return None
 
 
 def _resolve_project_access(project_alias: str):
